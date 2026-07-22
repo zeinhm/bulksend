@@ -34,8 +34,13 @@ async function sendWithRetry(
   recipient: Recipient,
   subject: string,
   body: string,
+  acquireRateSlot: () => Promise<void>,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    // Every attempt is a real request against the provider, so every
+    // attempt -- not just the first -- counts against the rate cap.
+    // Otherwise a retry storm can push actual request rate above --rate.
+    await acquireRateSlot();
     const result: SendResult = await mockProvider.send(recipient, subject, body);
     if (result.status === "sent") return { ok: true };
     if (result.status === "permanent_failure") return { ok: false, reason: result.reason };
@@ -106,11 +111,9 @@ export async function send(options: SendOptions): Promise<void> {
   const progressTimer = setInterval(printProgress, 500);
 
   async function processRow(recipient: Recipient): Promise<void> {
-    await acquireRateSlot();
-
     const subject = renderSubject(recipient.name);
     const body = renderBody(recipient.name);
-    const outcome = await sendWithRetry(recipient, subject, body);
+    const outcome = await sendWithRetry(recipient, subject, body, acquireRateSlot);
 
     if (outcome.ok) {
       await appendEntry(sentLog, { index: recipient.index });
