@@ -13,6 +13,16 @@ function parsePositiveInt(raw: string, flagName: string): number {
   return value;
 }
 
+function assertKnownFlags(flags: Record<string, string>, allowed: readonly string[], command: string): void {
+  const unknown = Object.keys(flags).filter((key) => !allowed.includes(key));
+  if (unknown.length > 0) {
+    console.error(
+      `Unknown flag(s) for '${command}': ${unknown.map((f) => `--${f}`).join(", ")}\nAllowed: ${allowed.map((f) => `--${f}`).join(", ")}`,
+    );
+    process.exit(1);
+  }
+}
+
 function parseFlags(args: string[]): Record<string, string> {
   const flags: Record<string, string> = {};
   for (let i = 0; i < args.length; i++) {
@@ -36,6 +46,7 @@ async function main(): Promise<void> {
 
   switch (command) {
     case "generate": {
+      assertKnownFlags(flags, ["count", "out"], "generate");
       const count = flags.count !== undefined ? parsePositiveInt(flags.count, "count") : 1_000_000;
       const out = flags.out ?? "recipients.csv";
       console.log(`Generating ${count.toLocaleString()} rows to ${out}...`);
@@ -46,6 +57,7 @@ async function main(): Promise<void> {
       break;
     }
     case "send": {
+      assertKnownFlags(flags, ["csv", "concurrency", "rate", "smtp", "limit"], "send");
       const csvPath = flags.csv ?? "recipients.csv";
       const concurrency = flags.concurrency !== undefined ? parsePositiveInt(flags.concurrency, "concurrency") : 50;
       const rate = flags.rate !== undefined ? parsePositiveInt(flags.rate, "rate") : 14;
@@ -67,10 +79,17 @@ async function main(): Promise<void> {
         }
       }
 
+      // Separate log files per transport: a mock dry-run "sent" and a real
+      // SMTP "sent" must never be treated as interchangeable on resume --
+      // otherwise a prior dry-run silently makes --smtp skip rows it has
+      // never actually sent for real.
+      const sentLogPath = useSmtp ? "sent.smtp.ndjson" : "sent.ndjson";
+      const failedLogPath = useSmtp ? "failed.smtp.ndjson" : "failed.ndjson";
+
       await send({
         csvPath,
-        sentLogPath: "sent.ndjson",
-        failedLogPath: "failed.ndjson",
+        sentLogPath,
+        failedLogPath,
         concurrency,
         ratePerSecond: rate,
         dryRun: !useSmtp,

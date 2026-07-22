@@ -2,7 +2,7 @@ import { createReadStream } from "node:fs";
 import { parse } from "csv-parse";
 import type { Provider, Recipient, SendResult } from "./provider.js";
 import { createRateLimiter } from "./limits.js";
-import { appendEntry, loadCompletedIndices, openAppendLog } from "./logs.js";
+import { loadCompletedIndices, openAppendLog } from "./logs.js";
 
 const SUBJECT_TEMPLATE = "A quick note just for {{name}}";
 const BODY_TEMPLATE = [
@@ -35,13 +35,20 @@ export interface SendOptions {
 
 const MAX_ATTEMPTS = 3;
 
+// "permanent" (a 550-class response) is a durable, never-retry verdict on
+// the address itself. "exhausted" only means this run's 3 attempts all hit
+// transient (429-class) responses -- the row is NOT known-bad, so resume
+// must give it another shot rather than skipping it forever like a
+// permanent failure.
+type FailureKind = "permanent" | "exhausted";
+
 async function sendWithRetry(
   provider: Provider,
   recipient: Recipient,
   subject: string,
   body: string,
   acquireRateSlot: () => Promise<void>,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
+): Promise<{ ok: true } | { ok: false; kind: FailureKind; reason: string }> {
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     // Every attempt is a real request against the provider, so every
     // attempt -- not just the first -- counts against the rate cap.
@@ -49,18 +56,27 @@ async function sendWithRetry(
     await acquireRateSlot();
     const result: SendResult = await provider.send(recipient, subject, body);
     if (result.status === "sent") return { ok: true };
-    if (result.status === "permanent_failure") return { ok: false, reason: result.reason };
+    if (result.status === "permanent_failure") return { ok: false, kind: "permanent", reason: result.reason };
     if (attempt < MAX_ATTEMPTS) {
       await new Promise((resolve) => setTimeout(resolve, result.retryAfterMs));
       continue;
     }
-    return { ok: false, reason: `429 rate-limited, retries exhausted after ${MAX_ATTEMPTS} attempts` };
+    return {
+      ok: false,
+      kind: "exhausted",
+      reason: `429 rate-limited, retries exhausted after ${MAX_ATTEMPTS} attempts`,
+    };
   }
   throw new Error("unreachable");
 }
 
 // Fast streaming line count so the progress line can show a real
-// "remaining" figure. Never buffers rows, just counts newlines.
+// "remaining" figure. Never buffers rows, just counts newlines -- display
+// only, not used for send correctness (the real read loop uses the CSV
+// parser below). Assumes no field contains an embedded literal newline;
+// our own generate.ts never emits one, so this holds for CSVs produced by
+// this tool. A hand-authored CSV with a quoted multi-line field would
+// inflate this count and skew the progress/remaining numbers.
 async function countDataRows(csvPath: string): Promise<number> {
   return new Promise((resolve, reject) => {
     let newlineCount = 0;
@@ -94,7 +110,9 @@ export async function send(options: SendOptions): Promise<void> {
   const renderBody = compileTemplate(BODY_TEMPLATE);
 
   const sentIndices = loadCompletedIndices(sentLogPath);
-  const failedIndices = loadCompletedIndices(failedLogPath);
+  // Only "permanent" failures count as done-forever; "exhausted" rows are
+  // eligible to be retried by this very run.
+  const failedIndices = loadCompletedIndices(failedLogPath, (entry) => entry.kind === "permanent");
   const alreadyDone = sentIndices.size + failedIndices.size;
 
   const totalRows = await countDataRows(csvPath);
@@ -126,10 +144,15 @@ export async function send(options: SendOptions): Promise<void> {
     const outcome = await sendWithRetry(provider, recipient, subject, body, acquireRateSlot);
 
     if (outcome.ok) {
-      await appendEntry(sentLog, { index: recipient.index });
+      await sentLog.write({ index: recipient.index });
       sentCount++;
     } else {
-      await appendEntry(failedLog, { index: recipient.index, email: recipient.email, reason: outcome.reason });
+      await failedLog.write({
+        index: recipient.index,
+        email: recipient.email,
+        kind: outcome.kind,
+        reason: outcome.reason,
+      });
       failedCount++;
     }
   }
@@ -171,8 +194,8 @@ export async function send(options: SendOptions): Promise<void> {
   clearInterval(progressTimer);
   printProgress(true);
 
-  sentLog.end();
-  failedLog.end();
+  await sentLog.close();
+  await failedLog.close();
 
   const limitSuffix = limit !== undefined ? ` limit=${limit}` : "";
   console.log(

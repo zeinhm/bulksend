@@ -6,7 +6,8 @@
   "scripts": {
     "generate": "tsx src/cli.ts generate",
     "send": "tsx src/cli.ts send",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "for f in test/*.test.ts; do echo \"--- $f ---\"; npx tsx \"$f\" || exit 1; done"
   },
   "dependencies": {
     "csv-parse": "^7.0.1",

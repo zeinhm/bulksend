@@ -1,5 +1,6 @@
 import { createWriteStream, existsSync, readFileSync, truncateSync } from "node:fs";
 import { once } from "node:events";
+import { finished } from "node:stream/promises";
 
 // Read once at startup: a set of row indices, not email strings, per the
 // plan (O(n) in row count, not in email-string bytes).
@@ -12,7 +13,14 @@ import { once } from "node:events";
 // no separator and corrupts what used to be a clean file). A malformed line
 // INSIDE the newline-terminated region isn't a torn write — real corruption
 // — and stays fatal.
-export function loadCompletedIndices(path: string): Set<number> {
+//
+// `predicate` decides which entries count as "done, skip on resume" -- e.g.
+// failed.ndjson entries with kind "exhausted" should NOT be treated as
+// done, since resume is exactly the mechanism that gives them another try.
+export function loadCompletedIndices(
+  path: string,
+  predicate?: (entry: Record<string, unknown> & { index: number }) => boolean,
+): Set<number> {
   if (!existsSync(path)) return new Set();
 
   const buf = readFileSync(path);
@@ -34,7 +42,10 @@ export function loadCompletedIndices(path: string): Set<number> {
     const line = lines[i]!;
     if (!line.trim()) continue;
     try {
-      indices.add((JSON.parse(line) as { index: number }).index);
+      const entry = JSON.parse(line) as Record<string, unknown> & { index: number };
+      if (!predicate || predicate(entry)) {
+        indices.add(entry.index);
+      }
     } catch (err) {
       throw new Error(`Corrupt line ${i + 1} in ${path}: ${(err as Error).message}`);
     }
@@ -42,12 +53,36 @@ export function loadCompletedIndices(path: string): Set<number> {
   return indices;
 }
 
-export function openAppendLog(path: string): NodeJS.WritableStream {
-  return createWriteStream(path, { flags: "a", encoding: "utf8" });
+export interface AppendLog {
+  write(entry: unknown): Promise<void>;
+  close(): Promise<void>;
 }
 
-export async function appendEntry(ws: NodeJS.WritableStream, entry: unknown): Promise<void> {
-  if (!ws.write(JSON.stringify(entry) + "\n")) {
-    await once(ws, "drain");
-  }
+// Wraps the raw write stream so a write-time failure (disk full, permission
+// revoked mid-run, etc.) surfaces as a rejected promise through write()/
+// close() instead of an unhandled "error" event that crashes the process
+// outside the normal CLI error path.
+export function openAppendLog(path: string): AppendLog {
+  const ws = createWriteStream(path, { flags: "a", encoding: "utf8" });
+  let streamError: Error | null = null;
+  ws.on("error", (err: Error) => {
+    streamError = err;
+  });
+
+  return {
+    async write(entry: unknown): Promise<void> {
+      if (streamError) throw streamError;
+      if (!ws.write(JSON.stringify(entry) + "\n")) {
+        // once(ws, "drain") also rejects if `ws` emits "error" first --
+        // Node's events.once() special-cases "error" for any other event
+        // it's asked to wait for.
+        await once(ws, "drain");
+      }
+      if (streamError) throw streamError;
+    },
+    async close(): Promise<void> {
+      ws.end();
+      await finished(ws);
+    },
+  };
 }

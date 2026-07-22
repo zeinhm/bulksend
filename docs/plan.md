@@ -21,9 +21,12 @@ as reasonably possible, without hitting real inboxes. Single TS/Node CLI script,
   550 responses, so the backoff path and dead-letter path are actually exercised,
   not just theoretical.
 - **Three outcomes per recipient, not two.** `sent.ndjson` (row index, on provider
-  ack), `failed.ndjson` (permanent failures — mock 550 — logged and skipped, never
-  retried), and implicit "pending" (absence from both). Transient failures (429/5xx)
-  retry with backoff; they don't touch either log until resolved.
+  ack), `failed.ndjson` (each entry tagged `kind: "permanent" | "exhausted"` — a
+  550-class response is permanent and skipped forever; a row that only exhausted
+  its 3 in-run retries on transient 429s is not known-bad, so it's not skipped on
+  the next `send` run and gets reprocessed), and implicit "pending" (absence from
+  both, or an "exhausted" entry). Transient failures retry with backoff within a
+  run before ever reaching that exhausted state.
 - **At-least-once, not exactly-once — stated, not hidden.** A kill between "provider
   accepted" and "log write flushed" can double-send. We accept and document this
   rather than claim a guarantee the design can't back up.
@@ -98,8 +101,10 @@ the script, flag it before implementing and cut scope rather than grow silently.
 2. `send --dry-run` completes all 1M with progress + emails/sec stats.
 3. Running `send` twice = zero duplicate sends (proven by test).
 4. `kill -9` mid-run, restart = resumes where it died, no duplicates (proven by test).
-5. Permanently-failing addresses land in `failed.ndjson` and are not retried on
-   resume (proven by test).
+5. Permanently-failing addresses land in `failed.ndjson` with `kind: "permanent"`
+   and are not retried on resume; addresses that only exhausted in-run retries
+   land with `kind: "exhausted"` and DO get retried on the next resume, rather
+   than being treated as dead forever (proven by test).
 6. ~100 emails visible in Mailpit, names personalized correctly (screenshot).
 7. README lists every assumption, the at-least-once tradeoff, and both throughput
    numbers (measured mock vs. real-provider estimate).
