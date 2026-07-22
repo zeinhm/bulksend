@@ -1,4 +1,5 @@
 import { generate } from "./generate.js";
+import { send } from "./send.js";
 
 function parsePositiveInt(raw: string, flagName: string): number {
   const value = Number(raw);
@@ -41,8 +42,30 @@ async function main(): Promise<void> {
       console.log(`Done in ${seconds.toFixed(1)}s.`);
       break;
     }
+    case "send": {
+      if (flags.smtp !== undefined) {
+        console.error(
+          "SMTP sending is not implemented yet. Drop --smtp to run in --dry-run mode against the mock provider.",
+        );
+        process.exit(1);
+      }
+      const csvPath = flags.csv ?? "recipients.csv";
+      const concurrency = flags.concurrency !== undefined ? parsePositiveInt(flags.concurrency, "concurrency") : 50;
+      const rate = flags.rate !== undefined ? parsePositiveInt(flags.rate, "rate") : 14;
+      await send({
+        csvPath,
+        sentLogPath: "sent.ndjson",
+        failedLogPath: "failed.ndjson",
+        concurrency,
+        ratePerSecond: rate,
+        dryRun: true,
+      });
+      break;
+    }
     default:
-      console.error(`Unknown command: ${command ?? "(none)"}\nUsage: cli generate [--count N] [--out path]`);
+      console.error(
+        `Unknown command: ${command ?? "(none)"}\nUsage:\n  cli generate [--count N] [--out path]\n  cli send [--csv path] [--concurrency N] [--rate N]`,
+      );
       process.exit(1);
   }
 }
