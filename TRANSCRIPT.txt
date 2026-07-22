@@ -1,0 +1,2328 @@
+╭─── Claude Code v2.1.209 ─────────────────────────────────────────────────────╮
+│                                                    │ Tips for getting        │
+│                 Welcome back Zein!                 │ started                 │
+│                                                    │ Run /init to create a … │
+│                       ▐▛███▜▌                      │ ─────────────────────── │
+│                      ▝▜█████▛▘                     │ What's new              │
+│                        ▘▘ ▝▝                       │ Added emoji shortcode … │
+│    Sonnet 5 · Claude Pro · zeinmrhb@gmail.com's    │ Added warnings when tr… │
+│    Organization                                    │ Fixed a memory leak wh… │
+│                 ~/projects/bulksend                │ /release-notes for more │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+ ▎ Fable 5 is now a standard part of your Max plan
+ ▎ You can use up to 50% of your weekly usage limit on Fable 5. If you hit your limit, you can continue on Fable 5 with usage credits. Fable 5 draws down usage faster than Opus 4.8. Run /model and select Fable to use it. Learn more: https://support.claude.com/en/articles/15424964-claude-fable-5-promotional-access
+
+❯ /login                                                                        
+  ⎿  Login successful
+
+❯ I'm doing a technical assessment. Task verbatim: "Imagine we have a list of   
+  1,000,000 customer email addresses, and we want to send them a single         
+  promotional message - the same email to everyone, personalized with each      
+  recipient's name. Build a script (or a small page) that sends this campaign,  
+  and make it finish as fast as reasonably possible."                           
+                                                                                
+  Rules: must not email real recipients (test inbox / dry run only). They       
+  evaluate how I think, not code volume. Keep it small.                         
+                                                                                
+  Here's how I see the problem - challenge me on what I'm missing:              
+  1. 1M rows means I stream the CSV, never hold it all in memory                
+  2. "As fast as possible" really means bounded concurrency - a real provider   
+     rate-limits you, so infinite parallelism is wrong, not fast                
+  3. A crash at 600k must resume at 600k without double-sending anyone          
+  4. Proof without real inboxes: Mailpit (local Docker SMTP) for correctness    
+     on a small slice, plus an in-process mock with simulated latency for the   
+     full 1M throughput run                                                     
+  5. One TypeScript CLI script, ~300 lines, no queues/Redis/workers - that      
+     would be overkill for a single-process assessment task                     
+                                                                                
+  What's wrong or missing in this framing? Don't write code yet.                
+
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+
+⏺ Your five points are solid instincts, but a few are underspecified in ways an
+  interviewer will probe. Going through them:
+
+  1. Streaming the CSV isn't the whole memory story. Your dedup/resume mechanism
+  needs the same discipline. If "resume without double-sending" means loading a
+  sent-log into an in-memory Set<email>, that's a second O(n) structure hiding
+  behind the "I streamed the input" claim — ~1M email strings is tens of MB,
+  probably fine, but it's inconsistent with your own stated principle. Cheaper
+  and more honest: track by row index/offset, not by email string, and rebuild a
+  Set<number> (or even a bitset) on startup.
+
+  2. Bounded concurrency ≠ rate limiting. These solve different problems.
+  Concurrency caps how many requests are in flight at once (protects your own
+  memory/file descriptors); rate limiting caps requests/sec (respects the
+  provider's actual constraint). If each mock call takes 200ms and you run 50
+  concurrent, you're doing ~250/sec regardless of what the real API allows — you
+  haven't modeled the provider's limit at all, just your own parallelism. A
+  real provider gives you 429s + Retry-After; if your mock doesn't simulate
+  throttling and backoff, your throughput number is fiction. This is the gap I'd
+  fix first — it's the difference between "I built a fast script" and "I built
+  something that survives contact with a real ESP."
+
+  3. Crash-resume needs a harder definition of "crash." Graceful shutdown
+  (SIGINT, drain queue, close file) is easy and proves nothing. Test with
+  SIGKILL mid-batch. That surfaces the real question you haven't answered yet:
+  do you mark "sent" before dispatch or after provider ack? After ack is
+  correct, but then a kill between "provider accepted" and "log write flushed"
+  is an unavoidable double-send window — meaning your system is at-least-once,
+  not exactly-once. Say that explicitly in the README as a conscious tradeoff
+  rather than letting the test appear to "prove" exactly-once when it can't.
+
+  4. You need a third bucket beyond sent/pending: failed. Not building bounce
+  handling is a reasonable scope cut, but without a distinct failure log, a
+  permanently-bad address (mock 550) looks identical to "never attempted" on
+  resume and gets retried forever, or silently swallowed. Separate retryable
+  (transient, backoff) from terminal (log and skip) failures — even a fake
+  distinction in the mock is more realistic than assuming every send eventually
+  succeeds.
+
+  5. The throughput number from the mock is only meaningful if you say what it 
+  represents. "1M sends in 40s" against an in-process mock with no real
+  network/provider limit is not a claim about real-world performance — it's a
+  claim about your event loop's I/O-bound concurrency ceiling. Make the README
+  explicit: measured mock throughput X, and separately, "at provider rate limit
+  of N req/s, wall time = 1M/N regardless of code." Otherwise the number looks
+  like it's claiming more than it can.
+
+  Smaller things worth a line in the README even if out of scope for code: CSV
+  field quoting (names with commas break naive split(',')), and not funneling 1M
+  individual completion writes through unbuffered per-line fs.appendFile calls
+  (batch or use a single write stream, or your "fast" script bottlenecks on disk
+  I/O you introduced yourself).
+
+  Net: your framing nails memory and idempotency but treats "fast" and "safe" as
+  solved by concurrency + a log file. The gap is rate-limiting/backoff as a
+  distinct concern from concurrency, and being upfront about at-least-once
+  semantics rather than implying exactly-once.
+
+✻ Sautéed for 58s
+
+※ recap: You're planning the 1M-email campaign script for your assessment; I just critiqued your design (mainly: separate rate-limiting from concurrency, and clarify at-least-once vs exactly-once resume semantics). Next: decide how to handle those before writing code. (disable recaps in /config)
+
+❯ understood. going through them:                                               
+                                                                                
+  1. agree - track sent by row index in a Set of numbers instead of storing     
+  email strings                                                                 
+                                                                                
+  2. alright - add a real rate limit (requests/sec cap) separate from the       
+  concurrency limit, and make the mock simulate 429 + Retry-After so the        
+  backoff actually gets exercised. but keep the limiter dead simpl.. a          
+  per-second window counter is fine, no token bucket lib.                       
+                                                                                
+  3. agree on the framing. test crash with SIGKILL not just ctrl+c, and we      
+  document it as at-least once within a small flush window instead of           
+  pretending exactly-once. put that in the README as a conscious tradeoff       
+                                                                                
+  4. ok, add failed.ndjson as a dead-letter log - permanent failures get logged 
+  and skipped, not retried forever. fake 550 vs 429 distinction in the mock is  
+  enough.                                                                       
+                                                                                
+  5. no code change, just README wording.. mock throughput is a claim about the 
+  pipeline, real ESP throughput is provider rate limit. I'll write it that      
+  way.                                                                          
+                                                                                
+  6. use a proper csv parser for quoting. buffered writes for the sent-log only 
+  if it doesn't complicate the code much - if it gets ugly, per-line append is  
+  fine at this scale.                                                           
+                                                                                
+  one thing overall: keep all this inside ~300 lines and one process — if       
+  something needs a lib or abstraction that grows the script, flag it and we    
+  cut scope                                                                     
+                                                                                
+  update the plan with this and write it to docs/plan.md - decisions, rejected  
+  alternatives, assumptions, out of scope. under a page. then stop, no code     
+  yet.                                                                          
+
+  Listed 1 directory (ctrl+o to expand)
+
+⏺ Write(docs/plan.md)
+  ⎿  Wrote 85 lines to docs/plan.md
+       1 # Plan: bulk campaign send (1M recipients)
+       2 
+       4 Send one promotional email, personalized by name, to 1,000,000 r
+         ecipients, as fast
+       5 as reasonably possible, without hitting real inboxes. Single TS/
+       6 ~300 lines, no queues/Redis/workers.
+       7 
+       8 ## Decisions
+      10 - **Streaming CSV in, streaming log out.** Never hold the recipi
+         ent list in memory.
+     … +123 lines (ctrl+o to expand)
+
+⏺ Written to docs/plan.md. Stopping here per your instruction — no code yet.
+
+✻ Worked for 27s
+
+※ recap: You're building a 1M-recipient bulk email sender for a technical assessment, and just finalized the design plan in docs/plan.md covering rate limiting, crash-resume, and failure handling. Next: start implementing the TypeScript CLI script. (disable recaps in /config)
+
+❯ plan looks good. two things before we lock it:                                
+                                                                                
+  1. the rate limit has no default number. pick one and tie it to something     
+  real (ex: SES default quota), not assumption.. one line in Decisions like     
+  "default N req/s, based on X, flag-configurable”                              
+  2. the plan lost the safety rails from my notes - dry-run is the DEFAULT      
+  mode, and --smtp must require an explicit --limit N (refuse to run smtp       
+  against the full list). add both to Decisions, then stop, we lock it after    
+  that                                                                          
+                                                                                
+                                                                                
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(docs/plan.md)
+  ⎿  Added 10 lines
+      36    1. Measured mock throughput (what the pipeline itself can pus
+          h, event-loop bound).
+      37    2. Real-world estimate = `1,000,000 / provider_rate_limit`, i
+          ndependent of code.
+      38    The mock number is a claim about the pipeline, not about a re
+          al ESP.
+      39 +- **Default rate limit: 14 req/s**, based on AWS SES's default 
+         +new-account sending                                            
+      40 +  rate (SES assigns 14 emails/second to new production accounts
+         + before any quota                                              
+      41 +  increase request). Configurable via `--rate`, so a reviewer c
+         +an see the effect of                                           
+      42 +  changing it without touching code.                           
+      43 +- **`--dry-run` is the default mode.** The script never calls `
+         +--smtp` unless the                                             
+      44 +  flag is explicitly passed. Running with no flags is always sa
+         +fe.                                                            
+      45 +- **`--smtp` requires an explicit `--limit N`.** The script ref
+         +uses to run in SMTP                                            
+      46 +  mode against the full recipient list — no `--limit` (or a lim
+         +it above a small                                               
+      47 +  sane ceiling) with `--smtp` is a hard error, not a warning. T
+         +his makes "accidentally                                        
+      48 +  emailing 1M real addresses" structurally impossible, not just
+         + discouraged.                                                  
+      49  
+      50  ## Rejected alternatives
+      51  
+
+⏺ Added both to Decisions. Plan is locked — no code yet, waiting on your
+  go-ahead.
+
+✻ Sautéed for 15s
+
+※ recap: You're planning a script to email-blast 1M personalized recipients fast and safely; the design plan in docs/plan.md is now locked with rate limits, dry-run defaults, and crash-safety rules. Next: start writing the actual script. (disable recaps in /config)
+
+❯ one more thing before code: add a short "Structure" section to the plan -     
+  just the file layout and what each module owns. something like                
+  src/generate.ts, src/send.ts, src/provider.ts (mock + smtp), src/limits.ts    
+  (concurrency + rate), src/logs.ts (sent/failed ndjson). keep it under 10      
+  lines, adjust the split if you disagree with it                               
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(docs/plan.md)
+  ⎿  Added 10 lines
+      47    sane ceiling) with `--smtp` is a hard error, not a warning. T
+          his makes "accidentally
+      48    emailing 1M real addresses" structurally impossible, not just
+           discouraged.
+      49  
+      50 +## Structure                                                   
+      51 +                                                               
+      52 +- `src/cli.ts` — entry point; parses flags, wires `generate`/`s
+         +end` commands.                                                 
+      53 +- `src/generate.ts` — streams `recipients.csv` (N rows) to disk
+         +.                                                              
+      54 +- `src/send.ts` — reads CSV, drives the send loop, applies limi
+         +ts, writes logs.                                               
+      55 +- `src/provider.ts` — `send(recipient)` interface; mock (simula
+         +ted latency,                                                   
+      56 +  429/550 injection) and smtp (Mailpit) implementations behind 
+         +it.                                                            
+      57 +- `src/limits.ts` — concurrency cap (p-limit) + rate limiter (p
+         +er-second window).                                             
+      58 +- `src/logs.ts` — `sent.ndjson` / `failed.ndjson` read (resume)
+         + and append.                                                   
+      59 +                                                               
+      60  ## Rejected alternatives
+      61  
+      62  - Token-bucket/leaky-bucket rate limiter library — a per-second
+           counter is enough
+
+⏺ Added, 6 lines, split is fine as you proposed — just made cli.ts the explicit
+  entry point so generate.ts/send.ts stay pure logic. Plan is locked.
+
+✻ Sautéed for 18s
+
+※ recap: You're planning a script to send a personalized promo email to 1M recipients without hitting real inboxes. The plan in docs/plan.md is now locked with decisions, structure, and safety rails; next step is to start writing the code.
+
+❯ next: implement the generate command from the plan. project setup + 1M fake   
+  {email, name} rows to recipients.csv, streamed (constant memory). make some   
+  names include commas and quotes so the csv quoting path actually gets         
+  exercised. then stop there, no sender code yet                                
+
+  Ran 1 shell command (ctrl+o to expand)
+⏺ Setting up the project skeleton first, then writing generate.ts.
+
+⏺ Write(package.json)
+  ⎿  Wrote 16 lines to package.json
+       1 {
+       2   "name": "bulksend",
+       3   "version": "0.1.0",
+       4   "private": true,
+       5   "type": "module",
+       6   "scripts": {
+       7     "generate": "tsx src/cli.ts generate",
+       8     "send": "tsx src/cli.ts send",
+       9     "typecheck": "tsc --noEmit"
+      10   },
+     … +6 lines (ctrl+o to expand)
+
+⏺ Write(tsconfig.json)
+  ⎿  Wrote 13 lines to tsconfig.json
+       1 {
+       2   "compilerOptions": {
+       3     "target": "ES2022",
+       4     "module": "NodeNext",
+       5     "moduleResolution": "NodeNext",
+       6     "strict": true,
+       7     "esModuleInterop": true,
+       8     "skipLibCheck": true,
+       9     "outDir": "dist",
+      10     "declaration": false
+     … +3 lines (ctrl+o to expand)
+
+⏺ Write(.gitignore)
+  ⎿  Wrote 4 lines to .gitignore
+      1 node_modules/
+      2 dist/
+      3 recipients.csv
+      4 *.ndjson
+
+⏺ Write(src/generate.ts)
+  ⎿  Wrote 71 lines to src/generate.ts
+      1 import { createWriteStream } from "node:fs";
+      2 import { once } from "node:events";
+      3 import { finished } from "node:stream/promises";
+      4 
+      5 const FIRST_NAMES = [
+        an", "Mia",
+      7   "Lucas", "Chidi", "Priya", "Hiro", "Fatima", "Anders", "Yara", 
+        "Kwame",
+      8   "Ingrid", "Diego", "Aaliyah",
+      9 ];
+     … +67 lines (ctrl+o to expand)
+
+⏺ Write(src/cli.ts)
+  ⎿  Wrote 44 lines to src/cli.ts
+       1 import { generate } from "./generate.js";
+       2 
+       3 function parseFlags(args: string[]): Record<string, string> {
+       4   const flags: Record<string, string> = {};
+       5   for (let i = 0; i < args.length; i++) {
+       6     const arg = args[i]!;
+       7     if (!arg.startsWith("--")) continue;
+       8     const key = arg.slice(2);
+       9     const next = args[i + 1];
+      10     if (next !== undefined && !next.startsWith("--")) {
+     … +36 lines (ctrl+o to expand)
+
+⏺ Now installing deps and testing — first a small run to check quoting, then the
+  full 1M run to confirm memory stays flat.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Typecheck is clean. Now a small run to inspect the quoting output.
+
+  Ran 4 shell commands (ctrl+o to expand)
+
+⏺ The quoting round-trips correctly through a real CSV parser — all 6 edge-case
+  names came back exactly as written. Now the full 1M run, watching memory to
+  confirm it stays flat.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Done. Project skeleton (package.json, tsconfig.json, .gitignore) plus
+  src/generate.ts and src/cli.ts are in place.
+
+  Verified:
+  - npm run generate -- --count 1000000 → 1,000,000 rows + header in
+  recipients.csv (43M), in 0.4s, peak RSS ~136MB flat (that's Node/tsx runtime
+  overhead, not row-count-dependent — confirms streaming, not buffering).
+  - CSV quoting is RFC 4180-correct: every 97th row uses a deliberately gnarly
+  name (embedded commas, embedded "...", an umlaut). Round-tripped the full file
+  through Python's csv module — all 10,310 edge-case rows parsed back to the
+  exact original string, no corruption.
+  - Emails use @example.test, reserved by RFC 2606 and guaranteed to never
+  resolve — safe even if something tried to actually deliver.
+
+  Stopping here — no sender code yet, per your instruction.
+
+✻ Brewed for 1m 46s
+
+※ recap: Building a bulk email campaign sender for a technical assessment; the CSV generator (1M streamed, quote-safe rows) is done and verified. Next: implement the send command with mock/SMTP providers, concurrency and rate limits, and crash-safe resume.
+
+❯ one nit in cli.ts before we move on:                                          
+  --count abc becomes NaN silently. please guard it.. non-integer or <= 0       
+  should be a hard error with a clear message                                   
+  ⎿  ⧉ Selected 48 lines from recipients.csv in Visual Studio Code
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 9 lines
+       1  import { generate } from "./generate.js";
+       2  
+       3 +function parsePositiveInt(raw: string, flagName: string): numbe
+         +r {                                                            
+       4 +  const value = Number(raw);                                   
+       5 +  if (!Number.isInteger(value) || value <= 0) {                
+       6 +    console.error(`Invalid --${flagName}: "${raw}" (must be a p
+         +ositive integer)`);                                            
+       7 +    process.exit(1);                                           
+       8 +  }                                                            
+       9 +  return value;                                                
+      10 +}                                                              
+      11 +                                                               
+      12  function parseFlags(args: string[]): Record<string, string> {
+      13    const flags: Record<string, string> = {};
+      14    for (let i = 0; i < args.length; i++) {
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 1 line, removed 1 line
+      32  
+      33    switch (command) {
+      34      case "generate": {
+      35 -      const count = Number(flags.count ?? 1_000_000);          
+      35 +      const count = flags.count !== undefined ? parsePositiveIn
+         +t(flags.count, "count") : 1_000_000;                           
+      36        const out = flags.out ?? "recipients.csv";
+      37        console.log(`Generating ${count.toLocaleString()} rows to
+           ${out}...`);
+      38        const start = performance.now();
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Fixed — parsePositiveInt rejects non-numeric, non-integer, zero, and negative
+  values with a clear message and exit code 1. Verified all four bad cases plus
+  the valid path.
+
+✻ Brewed for 21s
+
+❯ now the sender pipeline, dry-run + mock only (no smtp yet), per the plan      
+  stream recipients.csv with a real csv parser, compile the template once and   
+  interpolate {{name}} per row                                                  
+  concurrency via p-limit default 50 (--concurrency), rate cap default 14 req/s 
+  per the plan (--rate)                                                         
+  mock provider: 20-80ms latency, ~1% transient 429 with Retry-After honored by 
+  backoff (max 3 attempts), ~0.2% permanent 550 straight to failed.ndjson       
+  sent.ndjson gets row index on ack, both logs loaded into Sets on startup to   
+  skip already-processed rows                                                   
+  progress line: sent/failed/skipped/remaining + emails/sec. stop after this,   
+  no smtp yet.                                                                  
+
+  Read 1 file, ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(package.json)  ⎿  Added 3 lines
+       8      "send": "tsx src/cli.ts send",
+       9      "typecheck": "tsc --noEmit"
+      10    },
+      11 +  "dependencies": {                                            
+      12 +    "csv-parse": "^7.0.1"                                      
+      13 +  },                                                           
+      14    "devDependencies": {
+      15      "@types/node": "^20.14.0",
+      16      "tsx": "^4.16.0",
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now writing the four modules.
+
+⏺ Write(src/provider.ts)
+  ⎿  Wrote 39 lines to src/provider.ts
+       1 export interface Recipient {
+       2   index: number;
+       3   email: string;
+       4   name: string;
+       5 }
+       6 
+       7 export type SendResult =
+       8   | { status: "sent" }
+       9   | { status: "rate_limited"; retryAfterMs: number }
+      10   | { status: "permanent_failure"; reason: string };
+     … +33 lines (ctrl+o to expand)
+
+⏺ Write(src/limits.ts)
+  ⎿  Wrote 26 lines to src/limits.ts
+       1 // Fixed-window per-second rate gate. Bounded concurrency is han
+         dled in
+         ream) rather
+       3 // than here — see the note at the top of send.ts for why.
+       4 export function createRateLimiter(ratePerSecond: number): () => 
+       5   let windowStart = Date.now();
+       6   let countInWindow = 0;
+       7 
+       9     for (;;) {
+      10       const now = Date.now();
+     … +20 lines (ctrl+o to expand)
+
+⏺ Write(src/logs.ts)
+  ⎿  Wrote 24 lines to src/logs.ts
+       1 import { createWriteStream, existsSync, readFileSync } from "nod
+         e:fs";
+       3 
+       4 // Read once at startup: a set of row indices, not email strings
+         , per the
+       6 export function loadCompletedIndices(path: string): Set<number> 
+         {
+       7   if (!existsSync(path)) return new Set();
+       9   for (const line of readFileSync(path, "utf8").split("\n")) {
+      10     if (!line.trim()) continue;
+     … +17 lines (ctrl+o to expand)
+
+⏺ Write(src/send.ts)
+  ⎿  Wrote 160 lines to src/send.ts
+       1 import { createReadStream } from "node:fs";
+       2 import { parse } from "csv-parse";
+       3 import { mockProvider, type Recipient, type SendResult } from ".
+       4 import { createRateLimiter } from "./limits.js";
+       5 import { appendEntry, loadCompletedIndices, openAppendLog } from
+          "./logs.js";
+       6 
+       7 const SUBJECT_TEMPLATE = "A quick note just for {{name}}";
+       9   "Hi {{name}},",
+      10   "",
+     … +171 lines (ctrl+o to expand)
+
+⏺ Now wiring up the send command in cli.ts.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 1 line
+      1  import { generate } from "./generate.js";
+      2 +import { send } from "./send.js";                               
+      3  
+      4  function parsePositiveInt(raw: string, flagName: string): number
+          {
+      5    const value = Number(raw);
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 23 lines, removed 1 line
+      42        console.log(`Done in ${seconds.toFixed(1)}s.`);
+      43        break;
+      44      }
+      45 +    case "send": {                                             
+      46 +      if (flags.smtp !== undefined) {                          
+      47 +        console.error(                                         
+      48 +          "SMTP sending is not implemented yet. Drop --smtp to 
+         +run in --dry-run mode against the mock provider.",             
+      49 +        );                                                     
+      50 +        process.exit(1);                                       
+      51 +      }                                                        
+      52 +      const csvPath = flags.csv ?? "recipients.csv";           
+      53 +      const concurrency = flags.concurrency !== undefined ? par
+         +sePositiveInt(flags.concurrency, "concurrency") : 50;          
+      54 +      const rate = flags.rate !== undefined ? parsePositiveInt(
+         +flags.rate, "rate") : 14;                                      
+      55 +      await send({                                             
+      56 +        csvPath,                                               
+      57 +        sentLogPath: "sent.ndjson",                            
+      58 +        failedLogPath: "failed.ndjson",                        
+      59 +        concurrency,                                           
+      60 +        ratePerSecond: rate,                                   
+      61 +        dryRun: true,                                          
+      62 +      });                                                      
+      63 +      break;                                                   
+      64 +    }                                                          
+      65      default:
+      46 -      console.error(`Unknown command: ${command ?? "(none)"}\nU
+         -sage: cli generate [--count N] [--out path]`);                 
+      66 +      console.error(                                           
+      67 +        `Unknown command: ${command ?? "(none)"}\nUsage:\n  cli
+         + generate [--count N] [--out path]\n  cli send [--csv path] [--
+         +concurrency N] [--rate N]`,                                    
+      68 +      );                                                       
+      69        process.exit(1);
+      70    }
+      71  }
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Update(src/send.ts)
+  ⎿  Added 2 lines, removed 1 line
+      54    return new Promise((resolve, reject) => {
+      55      let newlineCount = 0;
+      56      const rs = createReadStream(csvPath, { encoding: "utf8" });
+      57 -    rs.on("data", (chunk: string) => {                         
+      57 +    rs.on("data", (raw: string | Buffer) => {                  
+      58 +      const chunk = typeof raw === "string" ? raw : raw.toStrin
+         +g("utf8");                                                     
+      59        let pos = 0;
+      60        for (;;) {
+      61          const idx = chunk.indexOf("\n", pos);
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Typecheck is clean. Now let's exercise it — small file first, checking
+  correctness, resume, and the failure paths.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ Good — all 3 failures were permanent 550s (retries handled the transient
+  429s), no duplicates, sent + failed = total rows exactly. Now testing resume:
+  running again on the same file should skip everything.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Perfect — full resume, zero re-sends, zero re-failures, all 2000 skipped. Now
+  testing crash-resume: kill mid-run with SIGKILL and confirm it picks up
+  cleanly.
+
+  Ran 4 shell commands (ctrl+o to expand)
+
+⏺ The kill didn't land fast enough — a leftover child process kept running
+  across my tool calls and finished the whole file before I fully killed it. Let
+  me redo with a slower rate so there's no ambiguity about "mid-run."
+
+  Read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Confirmed mid-run kill this time — only 99/50,000 processed. Now resuming to
+  verify it picks up cleanly and finishes without duplicates.
+
+  Ran 2 shell commands (ctrl+o to expand)
+⏺ All 50,000 rows accounted for exactly once, zero duplicates across the
+  crash-and-resume boundary. Cleaning up test artifacts.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Sender pipeline (dry-run + mock) is in. One deliberate deviation from the plan
+  worth flagging: I didn't use p-limit. Reasoning — if the CSV producer isn't
+  paced to match the concurrency cap, p-limit's internal queue would hold up to
+  ~1M pending closures in memory (one per unprocessed row), which quietly
+  violates the "streaming, constant memory" commitment the plan is built on.
+  Instead send.ts uses a Set-capped in-flight pool: the CSV read pauses once
+  concurrency rows are in flight, so memory never scales with file size. Rate
+  limiting is still exactly as planned — a per-second window counter in
+  limits.ts, no token-bucket library.
+
+  What's implemented and verified:
+  - CSV parsing: real streaming parser (csv-parse), not hand-rolled — reads
+  {email, name} per row with a row index.
+  - Template: compiled once ({{name}} placeholder split into parts, joined per
+  row — no per-row regex).
+  - Concurrency: --concurrency, default 50, bounded via the in-flight Set.
+  - Rate limit: --rate, default 14 req/s.
+  - Mock provider: 20-80ms latency, ~0.2% permanent 550, ~1% transient 429 with
+  Retry-After honored, max 3 attempts before a transient failure is logged as
+  exhausted-retries.
+  - Logs: sent.ndjson (row index only) and failed.ndjson (index, email, reason),
+  both loaded into Set<number> on startup to skip already-processed rows.
+  - Progress line: sent/failed/skipped/remaining (rate/s), updated every 500ms.
+  remaining is accurate because of a fast pre-pass line count (streaming,
+  doesn't buffer rows).
+
+  Tested directly (bypassing the CLI's hardcoded log paths by running from a
+  scratch dir):
+  - 2,000 rows, full run: 1997 sent + 3 failed (all permanent 550s — transient
+  429s were absorbed by retry) = 2000, zero duplicate indices.
+  - Re-ran the same file: 0 sent, 0 failed, 2000 skipped — full resume
+  confirmed.
+  - 50,000 rows, kill -9 after 2s (99 rows done) — restarted, skipped exactly
+  those 99, finished the remaining 49,901 with zero duplicates across the crash
+  boundary (verified by combining both logs and checking for repeated indices).
+
+  --smtp is wired to hard-error ("not implemented yet") rather than silently
+  doing nothing, so the safety rail shape from the plan is already in place for
+  when SMTP lands. Stopping here as instructed.
+
+✻ Cogitated for 7m 37s
+
+※ recap: Building a bulksend CLI to mail-merge 1M recipients safely (dry-run/mock only). Generate and send (with resume, rate limits, retries) are done and tested; next step is SMTP support behind Mailpit, still gated by the required --limit flag.
+
+❯ found something. after a clean run I appended a truncated line to sent.ndjson 
+  to simulate kill -9 landing mid-append (printf '{"index":123' >>              
+  sent.ndjson) and the next run crashes on startup with a parse error. so a     
+  crash at the wrong moment makes the whole campaign unresumable.. that defeats 
+  the resume design. my take on the fix: a malformed FINAL line should be       
+  tolerated - treat as not-sent, that row just re-sends, consistent with our    
+  at-least-once stance. but malformed in the MIDDLE should stay a hard error,   
+  that's real corruption not a torn write. agree? also noticed reading send.ts: 
+  acquireRateSlot is taken once per row, but a 429 retry hits the provider      
+  again without taking a new slot - so during retry storms real request rate    
+  can exceed --rate. against a real ESP every attempt counts. each attempt      
+  should acquire a slot.                                                        
+  btw your cleanup step earlier deleted recipients.csv from the project root,   
+  not just /tmp scratch - keep cleanup scoped next time. regenerated it, no     
+  harm done.                                                                    
+
+⏺ Both are real bugs. Fixing the log-parsing tolerance first (last line only,
+  tolerant; mid-file corruption stays fatal), then the rate-limiter-per-attempt
+  fix. Cleanup scope noted — sticking to files I explicitly create under /tmp or
+  the scratchpad from here on.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/logs.ts)
+  ⎿  Added 23 lines, removed 2 lines
+       3  
+       4  // Read once at startup: a set of row indices, not email string
+          s, per the
+       5  // plan (O(n) in row count, not in email-string bytes).
+       6 +//                                                             
+       7 +// A hard kill can land mid-`write()`, leaving a torn final lin
+         +e (no closing                                                  
+       8 +// brace, no trailing newline). That's expected under our at-le
+         +ast-once                                                       
+       9 +// stance, so a malformed LAST line is tolerated: treat that ro
+         +w as                                                           
+      10 +// not-yet-processed and let it re-send. A malformed line anywh
+         +ere else in                                                    
+      11 +// the file isn't a torn write — it's real corruption — and sta
+         +ys fatal.                                                      
+      12  export function loadCompletedIndices(path: string): Set<number>
+           {
+      13    if (!existsSync(path)) return new Set();
+      14    const indices = new Set<number>();
+       9 -  for (const line of readFileSync(path, "utf8").split("\n")) { 
+      15 +  const lines = readFileSync(path, "utf8").split("\n");        
+      16 +  while (lines.length > 0 && lines[lines.length - 1] === "") { 
+      17 +    lines.pop(); // drop the blank element from the file's trai
+         +ling "\n"                                                      
+      18 +  }                                                            
+      19 +  for (let i = 0; i < lines.length; i++) {                     
+      20 +    const line = lines[i]!;                                    
+      21      if (!line.trim()) continue;
+      11 -    indices.add((JSON.parse(line) as { index: number }).index);
+      22 +    try {                                                      
+      23 +      indices.add((JSON.parse(line) as { index: number }).index
+         +);                                                             
+      24 +    } catch (err) {                                            
+      25 +      if (i === lines.length - 1) {                            
+      26 +        console.warn(                                          
+      27 +          `Warning: ${path} ends with a truncated line (likely 
+         +a hard kill mid-write) -- treating that row as not-yet-processe
+         +d.`,                                                           
+      28 +        );                                                     
+      29 +        continue;                                              
+      30 +      }                                                        
+      31 +      throw new Error(`Corrupt line ${i + 1} in ${path}: ${(err
+         + as Error).message}`);                                         
+      32 +    }                                                          
+      33    }
+      34    return indices;
+      35  }
+
+⏺ Now the rate-limiter-per-attempt fix in send.ts.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/send.ts)
+  ⎿  Added 5 lines
+      34    recipient: Recipient,
+      35    subject: string,
+      36    body: string,
+      37 +  acquireRateSlot: () => Promise<void>,                        
+      38  ): Promise<{ ok: true } | { ok: false; reason: string }> {
+      39    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      40 +    // Every attempt is a real request against the provider, so
+         + every                                                         
+      41 +    // attempt -- not just the first -- counts against the rate
+         + cap.                                                          
+      42 +    // Otherwise a retry storm can push actual request rate abo
+         +ve --rate.                                                     
+      43 +    await acquireRateSlot();                                   
+      44      const result: SendResult = await mockProvider.send(recipien
+          t, subject, body);
+      45      if (result.status === "sent") return { ok: true };
+      46      if (result.status === "permanent_failure") return { ok: fal
+          se, reason: result.reason };
+
+⏺ Now updating processRow to stop acquiring a slot itself and pass the limiter
+  through instead.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/send.ts)
+  ⎿  Added 1 line, removed 3 lines
+      111    const progressTimer = setInterval(printProgress, 500);
+      112  
+      113    async function processRow(recipient: Recipient): Promise<voi
+           d> {
+      114 -    await acquireRateSlot();                                  
+      115 -                                                              
+      114      const subject = renderSubject(recipient.name);
+      115      const body = renderBody(recipient.name);
+      118 -    const outcome = await sendWithRetry(recipient, subject, bo
+          -dy);                                                          
+      116 +    const outcome = await sendWithRetry(recipient, subject, bo
+          +dy, acquireRateSlot);                                         
+      117  
+      118      if (outcome.ok) {
+      119        await appendEntry(sentLog, { index: recipient.index });
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now testing both fixes.
+
+  Ran 4 shell commands (ctrl+o to expand)
+
+⏺ Good catch potential — that repro also exposed a second bug: after tolerating
+  the torn line, the next append in that same run glued directly onto the torn
+  bytes (no separating newline), corrupting the file for the next read. Fixing
+  both together — the right invariant is "only newline-terminated lines are
+  durable; anything after the last \n gets discarded and the file truncated back
+  to clean" so the log self-heals across repeated crashes.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/logs.ts)
+  ⎿  Added 24 lines, removed 16 lines
+       1 -import { createWriteStream, existsSync, readFileSync } from "no
+         -de:fs";                                                        
+       1 +import { createWriteStream, existsSync, readFileSync, truncateS
+         +ync } from "node:fs";                                          
+       2  import { once } from "node:events";
+       3  
+       4  // Read once at startup: a set of row indices, not email string
+          s, per the
+       5  // plan (O(n) in row count, not in email-string bytes).
+       6  //
+       7 -// A hard kill can land mid-`write()`, leaving a torn final lin
+         -e (no closing                                                  
+       8 -// brace, no trailing newline). That's expected under our at-le
+         -ast-once                                                       
+       9 -// stance, so a malformed LAST line is tolerated: treat that ro
+         -w as                                                           
+      10 -// not-yet-processed and let it re-send. A malformed line anywh
+         -ere else in                                                    
+      11 -// the file isn't a torn write — it's real corruption — and sta
+         -ys fatal.                                                      
+       7 +// A hard kill can land mid-`write()`, leaving a torn tail with
+         + no closing                                                    
+       8 +// newline. Only newline-terminated lines count as durably reco
+         +rded: any                                                      
+       9 +// bytes after the last "\n" are discarded from the index set A
+         +ND truncated                                                   
+      10 +// off the file on disk, so the log self-heals before this run'
+         +s first                                                        
+      11 +// append (otherwise the next write lands directly after the to
+         +rn bytes with                                                  
+      12 +// no separator and corrupts what used to be a clean file). A m
+         +alformed line                                                  
+      13 +// INSIDE the newline-terminated region isn't a torn write — re
+         +al corruption                                                  
+      14 +// — and stays fatal.                                          
+      15  export function loadCompletedIndices(path: string): Set<number>
+           {
+      16    if (!existsSync(path)) return new Set();
+      14 -  const indices = new Set<number>();                           
+      15 -  const lines = readFileSync(path, "utf8").split("\n");        
+      16 -  while (lines.length > 0 && lines[lines.length - 1] === "") { 
+      17 -    lines.pop(); // drop the blank element from the file's trai
+         -ling "\n"                                                      
+      17 +                                                               
+      18 +  const buf = readFileSync(path);                              
+      19 +  const lastNewline = buf.lastIndexOf(0x0a);                   
+      20 +  const completeBytes = lastNewline + 1; // 0 if the file has n
+         +o newline at all                                               
+      21 +  const tornBytes = buf.length - completeBytes;                
+      22 +                                                               
+      23 +  if (tornBytes > 0) {                                         
+      24 +    console.warn(                                              
+      25 +      `Warning: ${path} has ${tornBytes} byte(s) after the last
+         + complete line (likely a hard kill mid-write) -- discarding the
+         +m; that row will be treated as not-yet-processed.`,            
+      26 +    );                                                         
+      27 +    truncateSync(path, completeBytes);                         
+      28    }
+      29 +                                                               
+      30 +  const indices = new Set<number>();                           
+      31 +  const text = buf.subarray(0, completeBytes).toString("utf8");
+      32 +  const lines = text.length > 0 ? text.split("\n").slice(0, -1)
+         + : [];                                                         
+      33    for (let i = 0; i < lines.length; i++) {
+      34      const line = lines[i]!;
+      35      if (!line.trim()) continue;
+      36      try {
+      37        indices.add((JSON.parse(line) as { index: number }).index
+          );
+      38      } catch (err) {
+      25 -      if (i === lines.length - 1) {                            
+      26 -        console.warn(                                          
+      27 -          `Warning: ${path} ends with a truncated line (likely 
+         -a hard kill mid-write) -- treating that row as not-yet-processe
+         -d.`,                                                           
+      28 -        );                                                     
+      29 -        continue;                                              
+      30 -      }                                                        
+      39        throw new Error(`Corrupt line ${i + 1} in ${path}: ${(err
+           as Error).message}`);
+      40      }
+      41    }
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Now re-running the exact torn-write repro plus a mid-file corruption negative
+  test to confirm both behaviors.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ That test still has row 123 already recorded earlier in the file (from the
+  completed first run), so "skipped=300" is correct there but doesn't isolate
+  the torn-tail case. Let me redo cleanly with an index that only exists as the
+  torn tail.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Row 250 correctly re-sent, no crash, skip count exactly matches the prior
+  valid entries. Now confirming the file is durably clean afterward and mid-file
+  corruption still hard-fails.
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ File is fully self-healed after the torn-tail run (300 clean lines, ends with
+  a single \n), and genuine mid-file corruption still hard-fails with a clear
+  error and exit code 1.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Both fixed and verified:
+
+  1. Torn-write tolerance. Turned out to be two bugs, not one — your repro also
+  exposed that after the read tolerated a torn last line, appending in the same
+  run glued the next entry directly onto the torn bytes with no separating
+  newline, corrupting the file for the next read. Redesigned
+  loadCompletedIndices around a simpler invariant: only newline-terminated lines
+  are durable. Anything after the final \n is discarded from the index set and
+  truncated off the file on disk before this run's first append — so the log
+  self-heals rather than accumulating garbage across repeated crashes. Verified:
+  a torn tail at an index not seen elsewhere in the file gets correctly treated
+  as not-sent and re-sent, the file comes out with exactly 300 clean parseable
+  lines afterward, and genuine mid-file corruption (a garbled line 6 of 300)
+  still hard-fails with a clear error and exit 1.
+
+  2. Rate limit per attempt, not per row. acquireRateSlot() moved from
+  processRow into the retry loop in sendWithRetry, called before every attempt
+  including retries. Every real request against the provider now counts against
+  --rate, so a retry storm can't push actual request rate above the configured
+  cap.
+
+  On the cleanup — noted, scoping any future cleanup to files I create under
+  /tmp or the scratchpad, not touching the project root.
+
+✻ Sautéed for 3m 32s
+
+※ recap: Building the bulk email sender for the technical assessment; just fixed a torn-log crash bug and a rate-limit gap in send.ts, both verified. Next: keep going on the sender, or move to SMTP/Mailpit integration when ready.
+
+❯ now smtp mode per the plan: nodemailer pointed at localhost:1025 (mailpit).   
+  --smtp requires an explicit --limit N and refuses without it - hard error,    
+  and cap the ceiling at something sane like 1000. everything else stays        
+  identical (concurrency, rate, retry, logs) - only the transport changes       
+  behind the provider interface. keep the mock as the default; smtp only when   
+  the flag is passed.                                                           
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ Mailpit image is available. Let's implement the SMTP provider now.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(package.json)
+  ⎿  Added 2 lines, removed 1 line
+       9      "typecheck": "tsc --noEmit"
+      10    },
+      11    "dependencies": {
+      12 -    "csv-parse": "^7.0.1"                                      
+      12 +    "csv-parse": "^7.0.1",                                     
+      13 +    "nodemailer": "^9.0.3"                                     
+      14    },
+      15    "devDependencies": {
+      16      "@types/node": "^20.14.0",
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now adding the SMTP provider to provider.ts.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/provider.ts)
+  ⎿  Added 2 lines
+      1 +import nodemailer from "nodemailer";                            
+      2 +                                                                
+      3  export interface Recipient {
+      4    index: number;
+      5    email: string;
+
+⏺ Update(src/provider.ts)
+  ⎿  Added 26 lines
+      39      return { status: "sent" };
+      40    },
+      41  };
+      42 +                                                               
+      43 +const FROM_ADDRESS = "campaign@example.test";                  
+      44 +                                                               
+      45 +// Mailpit's default SMTP listener: no auth, no TLS.           
+      46 +const transporter = nodemailer.createTransport({               
+      47 +  host: "localhost",                                           
+      48 +  port: 1025,                                                  
+      49 +  secure: false,                                               
+      50 +});                                                            
+      51 +                                                               
+      52 +export const smtpProvider: Provider = {                        
+      53 +  async send(recipient: Recipient, subject: string, body: strin
+         +g): Promise<SendResult> {                                      
+      54 +    try {                                                      
+      55 +      await transporter.sendMail({ from: FROM_ADDRESS, to: reci
+         +pient.email, subject, text: body });                           
+      56 +      return { status: "sent" };                               
+      57 +    } catch (err) {                                            
+      58 +      const responseCode = (err as { responseCode?: unknown }).
+         +responseCode;                                                  
+      59 +      // SMTP 4xx is a temporary failure (retry); 5xx and every
+         +thing else is                                                  
+      60 +      // treated as permanent, matching the mock provider's spl
+         +it.                                                            
+      61 +      if (typeof responseCode === "number" && responseCode >= 4
+         +00 && responseCode < 500) {                                    
+      62 +        return { status: "rate_limited", retryAfterMs: 300 };  
+      63 +      }                                                        
+      64 +      return { status: "permanent_failure", reason: err instanc
+         +eof Error ? err.message : String(err) };                       
+      65 +    }                                                          
+      66 +  },                                                           
+      67 +};                                                             
+
+⏺ Now updating send.ts to accept a provider and an optional limit, and to
+  enforce the limit as a structural cap on the CSV read loop.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/send.ts)
+  ⎿  Added 1 line, removed 1 line
+      1  import { createReadStream } from "node:fs";
+      2  import { parse } from "csv-parse";
+      3 -import { mockProvider, type Recipient, type SendResult } from ".
+        -/provider.js";                                                  
+      3 +import type { Provider, Recipient, SendResult } from "./provider
+        +.js";                                                           
+      4  import { createRateLimiter } from "./limits.js";
+      5  import { appendEntry, loadCompletedIndices, openAppendLog } from
+          "./logs.js";
+      6  
+
+⏺ Update(src/send.ts)
+  ⎿  Added 7 lines, removed 1 line
+      26    concurrency: number;
+      27    ratePerSecond: number;
+      28    dryRun: boolean;
+      29 +  provider: Provider;                                          
+      30 +  // Hard cap on how many CSV rows are even read this run. Requ
+         +ired and                                                       
+      31 +  // enforced whenever dryRun is false -- SMTP mode must never 
+         +be able to                                                     
+      32 +  // reach the full recipient list.                            
+      33 +  limit?: number;                                              
+      34  }
+      35  
+      36  const MAX_ATTEMPTS = 3;
+      37  
+      38  async function sendWithRetry(
+      39 +  provider: Provider,                                          
+      40    recipient: Recipient,
+      41    subject: string,
+      42    body: string,
+     ...
+      47      // attempt -- not just the first -- counts against the rate
+           cap.
+      48      // Otherwise a retry storm can push actual request rate abo
+          ve --rate.
+      49      await acquireRateSlot();
+      44 -    const result: SendResult = await mockProvider.send(recipien
+         -t, subject, body);                                             
+      50 +    const result: SendResult = await provider.send(recipient, s
+         +ubject, body);                                                 
+      51      if (result.status === "sent") return { ok: true };
+      52      if (result.status === "permanent_failure") return { ok: fal
+          se, reason: result.reason };
+      53      if (attempt < MAX_ATTEMPTS) {
+
+⏺ Now the main send() body — the dry-run guard, destructure, progress calc, loop
+  cap, and final summary.
+
+⏺ Update(src/send.ts)
+  ⎿  Added 7 lines, removed 3 lines
+      81  }
+      82  
+      83  export async function send(options: SendOptions): Promise<void>
+           {
+      84 -  const { csvPath, sentLogPath, failedLogPath, concurrency, rat
+         -ePerSecond, dryRun } = options;                                
+      84 +  const { csvPath, sentLogPath, failedLogPath, concurrency, rat
+         +ePerSecond, dryRun, provider, limit } = options;               
+      85  
+      86 -  if (!dryRun) {                                               
+      87 -    throw new Error("Only --dry-run is supported right now; SMT
+         -P sending is not implemented yet.");                           
+      86 +  // Belt-and-suspenders: the CLI already refuses --smtp withou
+         +t --limit,                                                     
+      87 +  // but this is the function that actually talks to a real tra
+         +nsport, so                                                     
+      88 +  // the invariant is enforced here too, not just at the flag-p
+         +arsing layer.                                                  
+      89 +  if (!dryRun && (limit === undefined || limit <= 0)) {        
+      90 +    throw new Error("Refusing to run a non-dry-run send without
+         + a positive limit.");                                          
+      91    }
+      92  
+      93    const renderSubject = compileTemplate(SUBJECT_TEMPLATE);
+     ...
+       98    const alreadyDone = sentIndices.size + failedIndices.size;
+       99  
+      100    const totalRows = await countDataRows(csvPath);
+      101 +  const effectiveTotal = limit !== undefined ? Math.min(totalR
+          +ows, limit) : totalRows;                                      
+      102  
+      103    const sentLog = openAppendLog(sentLogPath);
+      104    const failedLog = openAppendLog(failedLogPath);
+
+⏺ Update(src/send.ts)
+  ⎿  Added 1 line, removed 1 line
+      113      const elapsedSec = (Date.now() - startedAt) / 1000;
+      114      const processed = sentCount + failedCount;
+      115      const rate = elapsedSec > 0 ? processed / elapsedSec : 0;
+      116 -    const remaining = Math.max(totalRows - alreadyDone - proce
+          -ssed, 0);                                                     
+      116 +    const remaining = Math.max(effectiveTotal - alreadyDone - 
+          +processed, 0);                                                
+      117      const line = `sent=${sentCount} failed=${failedCount} skip
+           ped=${skippedCount} remaining=${remaining} (${rate.toFixed(1)}
+           /s)`;
+      118      process.stdout.write(final ? `${line}\n` : `\r${line}   `)
+           ;
+      119    }
+
+⏺ Update(src/send.ts)
+  ⎿  Added 1 line, removed 1 line
+      123    async function processRow(recipient: Recipient): Promise<voi
+           d> {
+      124      const subject = renderSubject(recipient.name);
+      125      const body = renderBody(recipient.name);
+      126 -    const outcome = await sendWithRetry(recipient, subject, bo
+          -dy, acquireRateSlot);                                         
+      126 +    const outcome = await sendWithRetry(provider, recipient, s
+          +ubject, body, acquireRateSlot);                               
+      127  
+      128      if (outcome.ok) {
+      129        await appendEntry(sentLog, { index: recipient.index });
+
+⏺ Now the CSV loop — add the hard structural cap so SMTP mode literally cannot
+  read past limit rows.
+
+⏺ Update(src/send.ts)
+  ⎿  Added 6 lines
+      144    for await (const record of parser as AsyncIterable<Record<st
+           ring, string>>) {
+      145      const index = rowIndex++;
+      146  
+      147 +    if (limit !== undefined && index >= limit) {              
+      148 +      // Hard structural cap: stop reading the CSV entirely. R
+          +ows beyond                                                    
+      149 +      // --limit are never even looked at in a non-dry-run.   
+      150 +      break;                                                  
+      151 +    }                                                         
+      152 +                                                              
+      153      if (sentIndices.has(index) || failedIndices.has(index)) {
+      154        skippedCount++;
+      155        continue;
+
+  Read 1 file (ctrl+o to expand)
+⏺ Update(src/send.ts)
+  ⎿  Added 2 lines, removed 1 line
+      174    sentLog.end();
+      175    failedLog.end();
+      176  
+      177 +  const limitSuffix = limit !== undefined ? ` limit=${limit}` 
+          +: "";                                                         
+      178    console.log(
+      178 -    `Done. sent=${sentCount} failed=${failedCount} skipped=${s
+          -kippedCount} total_rows=${totalRows} already_done_before_this_
+          -run=${alreadyDone}`,                                          
+      179 +    `Done. sent=${sentCount} failed=${failedCount} skipped=${s
+          +kippedCount} total_rows_in_file=${totalRows}${limitSuffix} alr
+          +eady_done_before_this_run=${alreadyDone}`,                    
+      180    );
+      181  }
+
+⏺ Now wiring cli.ts — the --smtp / --limit safety rail with a hard ceiling.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 3 lines
+      1  import { generate } from "./generate.js";
+      2  import { send } from "./send.js";
+      3 +import { mockProvider, smtpProvider } from "./provider.js";     
+      4  
+      5 +const SMTP_LIMIT_CEILING = 1000;                                
+      6 +                                                                
+      7  function parsePositiveInt(raw: string, flagName: string): number
+          {
+      8    const value = Number(raw);
+      9    if (!Number.isInteger(value) || value <= 0) {
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 22 lines, removed 8 lines
+      46        break;
+      47      }
+      48      case "send": {
+      49 -      if (flags.smtp !== undefined) {                          
+      50 -        console.error(                                         
+      51 -          "SMTP sending is not implemented yet. Drop --smtp to 
+         -run in --dry-run mode against the mock provider.",             
+      52 -        );                                                     
+      53 -        process.exit(1);                                       
+      54 -      }                                                        
+      49        const csvPath = flags.csv ?? "recipients.csv";
+      50        const concurrency = flags.concurrency !== undefined ? par
+          sePositiveInt(flags.concurrency, "concurrency") : 50;
+      51        const rate = flags.rate !== undefined ? parsePositiveInt(
+          flags.rate, "rate") : 14;
+      52 +                                                               
+      53 +      let limit: number | undefined;                           
+      54 +      const useSmtp = flags.smtp !== undefined;                
+      55 +                                                               
+      56 +      if (useSmtp) {                                           
+      57 +        if (flags.limit === undefined) {                       
+      58 +          console.error(                                       
+      59 +            "--smtp requires an explicit --limit N (refusing to
+         + run against the full recipient list).",                       
+      60 +          );                                                   
+      61 +          process.exit(1);                                     
+      62 +        }                                                      
+      63 +        limit = parsePositiveInt(flags.limit, "limit");        
+      64 +        if (limit > SMTP_LIMIT_CEILING) {                      
+      65 +          console.error(`--limit ${limit} exceeds the safety ce
+         +iling of ${SMTP_LIMIT_CEILING} for --smtp mode.`);             
+      66 +          process.exit(1);                                     
+      67 +        }                                                      
+      68 +      }                                                        
+      69 +                                                               
+      70        await send({
+      71          csvPath,
+      72          sentLogPath: "sent.ndjson",
+      73          failedLogPath: "failed.ndjson",
+      74          concurrency,
+      75          ratePerSecond: rate,
+      64 -        dryRun: true,                                          
+      76 +        dryRun: !useSmtp,                                      
+      77 +        provider: useSmtp ? smtpProvider : mockProvider,       
+      78 +        limit,                                                 
+      79        });
+      80        break;
+      81      }
+      82      default:
+      83        console.error(
+      70 -        `Unknown command: ${command ?? "(none)"}\nUsage:\n  cli
+         - generate [--count N] [--out path]\n  cli send [--csv path] [--
+         -concurrency N] [--rate N]`,                                    
+      84 +        `Unknown command: ${command ?? "(none)"}\nUsage:\n  cli
+         + generate [--count N] [--out path]\n  cli send [--csv path] [--
+         +concurrency N] [--rate N] [--smtp --limit N]`,                 
+      85        );
+      86        process.exit(1);
+      87    }
+
+  Searched for 1 pattern, read 1 file, ran 2 shell commands (ctrl+o to expand)
+
+⏺ Update(package.json)
+  ⎿  Added 1 line
+      14    },
+      15    "devDependencies": {
+      16      "@types/node": "^20.14.0",
+      17 +    "@types/nodemailer": "^8.0.1",                             
+      18      "tsx": "^4.16.0",
+      19      "typescript": "^5.5.0"
+      20    }
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Now the safety-rail checks (no code path to real sending), then bring up
+  Mailpit and test an actual send.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ There's already a Mailpit instance running on this machine (port 1025/8025) —
+  my --limit 3 test actually delivered. Let's verify via Mailpit's API.
+
+  Ran 5 shell commands (ctrl+o to expand)
+
+⏺ Both edge-case names (commas and embedded quotes) delivered and rendered
+  correctly through real SMTP. Now testing the resume/dedup path against SMTP
+  mode, and confirming the limit truly blocks rows beyond it even across resumed
+  runs.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Exactly 150 delivered, resume + limit compose correctly. Cleaning up.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ SMTP mode is in and verified end to end.
+
+  What changed:
+  - provider.ts: added smtpProvider using nodemailer against localhost:1025
+  (Mailpit's default, no auth/TLS). SMTP 4xx maps to rate_limited (retryable),
+  everything else (5xx, connection errors) maps to permanent_failure — same
+  two-bucket split as the mock, so retry/logging logic is untouched.
+  - send.ts: SendOptions now takes a provider (injected, no more hardcoded mock)
+  and an optional limit. The limit is enforced as a hard structural cap in the
+  CSV read loop itself (break once index >= limit) — SMTP mode physically never
+  reads past row limit, not just "stops sending." Also double-checked at the
+  function level (if (!dryRun && limit undefined/≤0) throw), independent of the
+  CLI's own check.
+  - cli.ts: --smtp without --limit hard-errors; --limit over 1000 hard-errors.
+  No flags → mock + dry-run, unchanged default.
+
+  Verified against a live Mailpit instance already running on this machine:
+  - No --limit with --smtp → refused, exit 1. --limit 5000 and --limit 1001 →
+  both refused (ceiling is 1000). --limit 3 → sent exactly 3, confirmed in
+  Mailpit.
+  - --limit 100 → exactly 100 delivered to Mailpit, confirmed via its API,
+  including the two CSV edge-case names (Smith, John and O'Brien, Jane "JJ")
+  rendering correctly in both subject and body over real SMTP.
+  - Resume composes correctly with the limit: re-running --limit 100 skipped all
+  100 (0 sent). Raising to --limit 150 sent exactly the 50 new rows, never
+  touching the rest of the 5000-row file. Mailpit total after both runs: 150.
+
+✻ Cogitated for 3m 49s
+
+※ recap: Building the bulk email sender CLI: generate, send (mock+SMTP with dry-run/limit safety rails) are done and tested against Mailpit. Next: implement crash-resume and throughput tests at full 1M scale per the plan's done-when checklist.
+
+❯ create a subagent called "tester": Read, Grep, and Bash for running tests     
+  only, no Edit. it must NOT read docs/plan.md or NOTES.md - I want an          
+  evaluator that hasn't seen my reasoning, only the code.                       
+
+  Listed 2 directories, ran 1 shell command (ctrl+o to expand)
+
+⏺ Write(.claude/agents/tester.md)
+  ⎿  Wrote 17 lines to .claude/agents/tester.md
+      1 ---
+      3 description: Read-only test-runner subagent for this project. Ver
+        berately without seeing docs/plan.md or NOTES.md, to give an eval
+        ant an independent, cold read on whether the implementation actua
+        ng discussions.
+      4 tools: Read, Grep, Bash
+      6 
+        reading source and running tests/commands — never by trusting sta
+      8 
+        e view the contents of 
+     … +32 lines (ctrl+o to expand)
+
+⏺ Created .claude/agents/tester.md — a project-scoped subagent with only Read,
+  Grep, Bash (no Edit), and a hard instruction never to open docs/plan.md or
+  NOTES.md, framed explicitly as evaluator-blindness so its judgment comes from
+  the code and observed behavior, not your design reasoning. You can invoke it
+  with Agent(subagent_type: "tester", ...).
+✻ Brewed for 35s
+
+❯ use the tester subagent to review the code and write tests:                   
+  1. unit test for template personalization including a name with commas and    
+  quotes.                                                                       
+  2. integration on 1000 rows: running send twice produces zero duplicate       
+  sends, assert via sent.ndjson indices.                                        
+  3. integration: kill -9 mid-run, rerun, assert all rows accounted for exactly 
+  once across the crash boundary.                                               
+  4. the torn-line case: truncated final line in sent.ndjson must warn +        
+  self-heal, corrupt middle line must hard-error. report code issues it finds   
+  separately from the tests.                                                    
+
+⏺ tester(Tester subagent: write and run test suite)
+  ⎿  Initializing…
+  ⎿  Error: Agent type 'tester' not found. Available agents: claude, 
+     claude-code-guide, Explore, general-purpose, Plan, statusline-setup, 
+     vercel:ai-architect, vercel:deployment-expert, vercel:performance-optimizer
+
+⏺ The tester agent definition is written correctly, but this session's agent
+  registry was loaded at startup — it doesn't see the new file yet. Options: I
+  can run this exact task now using general-purpose with the same
+  tool/instruction constraints inlined (functionally equivalent for this run,
+  just not a reusable named agent yet), or you can restart the session so tester
+  registers and I invoke it by name.
+
+⏺ User answered Claude's questions:
+  ⎿  · The new tester agent isn't loaded in this session yet. How do you want to
+     proceed? → Run now via general-purpose (Recommended)
+
+⏺ Agent(Tester subagent: write and run test suite)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ Tester agent is running in the background — writing the four test suites
+  (template personalization, double-run dedup, crash/resume, torn-log handling)
+  and doing a blind code review of src/*.ts, with no access to docs/plan.md or
+  NOTES.md. I'll report back once it finishes.
+
+✻ Brewed for 1m 52s
+
+⏺ Agent "Tester subagent: write and run test suite" finished · 5m 19s
+
+⏺ Tester agent finished — all 4 tests pass, and it surfaced 8 code review
+  findings from a cold read (no docs/plan.md/NOTES.md).
+
+  Tests (test/01-template.test.ts through 04-torn-and-corrupt-lines.test.ts, all
+  in project root):
+  1. Template: O'Brien, Jane "JJ" rendered verbatim in subject/body, unmangled.
+  2. 1000 rows, double-run: run 1 → 1000 sent; run 2 → 0 sent/0 failed/1000
+  skipped. Combined index set: 1000 unique, covers 0–999 exactly.
+  3. Crash/resume (4000 rows, killed at 60/4000 done): resumed to completion,
+  final sent+failed = 4000, unique, covers 0–3999 exactly, zero duplicates.
+  4. Torn line: warns ("...5 byte(s) after the last complete line..."), exit 0,
+  row re-sent, file fully valid JSON after. Mid-file corruption: exits 1 with a
+  clear error, doesn't continue silently.
+
+  Code review findings, most significant first:
+
+  1. Retries-exhausted rows never get a second chance on resume. A row that hit
+  failed.ndjson only because it exhausted 3 retries on a transient 429 gets
+  treated identically to a permanent 550 forever after — the resume path (the
+  whole point of this tool) will never retry it in a later run, even though the
+  failure was transient in nature.
+  2. No error listener on the sent/failed log write streams. A write failure
+  (disk full, permissions) throws as an uncaught exception rather than going
+  through the graceful console.error/exit(1) path used elsewhere — bypasses
+  main().catch since it's not a promise rejection.
+  3. countDataRows counts raw \n bytes rather than using the CSV parser — a
+  quoted field with an embedded literal newline would inflate the progress/total
+  numbers (doesn't affect actual send correctness, just the displayed stats).
+  4. sentLog.end()/failedLog.end() aren't awaited, unlike generate.ts's
+  ws.end(); await finished(ws) — inconsistent, and compounds finding #2.
+  5. Fixed-window rate limiter allows momentary ~2x bursts at window boundaries
+  — worth knowing if --rate is meant as a hard ceiling against a real provider.
+  6. loadCompletedIndices silently dedups via Set.add — a genuine duplicate
+  index within one log file (a symptom of exactly the bug class this design
+  exists to prevent) passes through unflagged.
+  7. parseFlags doesn't validate flag names — a typo like --consurrency is
+  silently ignored and falls back to the default, no warning.
+  8. Mixing --smtp and mock dry-run against the same log files is a silent
+  footgun — there's no marker distinguishing a mock-sent row from a
+  real-SMTP-sent row, so a dry-run pass followed by --smtp will skip rows as
+  "already sent" that were only ever mock-sent.
+
+  Want me to fix any of these now, or hold and let you decide priority?
+
+✻ Cogitated for 28m 8s
+
+※ recap: Building a bulk-email campaign CLI (dry-run/mock + Mailpit SMTP) with crash-safe resume. A blind tester subagent just finished writing tests and found 8 code issues; waiting on you to say which to fix first.
+
+❯ good findings, the blind read worked. triage:                                 
+                                                                                
+  fix now:                                                                      
+  1. yes - this is the biggest one, it undermines the resume story. write kind: 
+  "permanent" | "exhausted" into failed.ndjson entries, and on startup only     
+  skip permanent ones. exhausted rows get another chance next run. that's what  
+  resume is for                                                                 
+  2 + 4. yes, both - add error listeners on the log streams and await the       
+  .end()s like generate does                                                    
+  7. yes - reject unknown flags with a clear error. this exact thing bit me     
+  earlier with a wrong flag name silently falling back to defaults              
+  8. yes - real footgun. separate log files per mode, sent.ndjson stays for     
+  dry-run, sent.smtp.ndjson + failed.smtp.ndjson for --smtp                     
+                                                                                
+  decline:                                                                      
+  3. display-only and our generator can't emit embedded newlines - add a code   
+  comment on countDataRows stating the assumption, no fix                       
+  5. that's the documented tradeoff from the design - window counter over token 
+  bucket, on purpose. real providers don't enforce per-second caps that hard    
+  anyway. goes in the README as a known characteristic                          
+  6. defends against a state the design can't produce, and Set dedup already    
+  handles it benignly. out of scope                                             
+                                                                                
+  after the fixes, rerun all 4 tests + make sure test 2 and 3 still pass with   
+  the new failed.ndjson format                                                  
+  ⎿  ⧉ Selected 159 lines from test/04-torn-and-corrupt-lines.test.ts in Visual 
+     Studio Code
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now rewriting logs.ts for the predicate-filtered index loading and the
+  leak-proof error-aware append log.
+
+⏺ Update(src/logs.ts)
+  ⎿  Added 43 lines, removed 8 lines
+      1  import { createWriteStream, existsSync, readFileSync, truncateSy
+         nc } from "node:fs";
+      2  import { once } from "node:events";
+      3 +import { finished } from "node:stream/promises";                
+      4  
+      5  // Read once at startup: a set of row indices, not email strings
+         , per the
+      6  // plan (O(n) in row count, not in email-string bytes).
+     ...
+      13  // no separator and corrupts what used to be a clean file). A m
+          alformed line
+      14  // INSIDE the newline-terminated region isn't a torn write — re
+          al corruption
+      15  // — and stays fatal.
+      15 -export function loadCompletedIndices(path: string): Set<number>
+         - {                                                             
+      16 +//                                                             
+      17 +// `predicate` decides which entries count as "done, skip on re
+         +sume" -- e.g.                                                  
+      18 +// failed.ndjson entries with kind "exhausted" should NOT be tr
+         +eated as                                                       
+      19 +// done, since resume is exactly the mechanism that gives them 
+         +another try.                                                   
+      20 +export function loadCompletedIndices(                          
+      21 +  path: string,                                                
+      22 +  predicate?: (entry: Record<string, unknown> & { index: number
+         + }) => boolean,                                                
+      23 +): Set<number> {                                               
+      24    if (!existsSync(path)) return new Set();
+      25  
+      26    const buf = readFileSync(path);
+     ...
+      42      const line = lines[i]!;
+      43      if (!line.trim()) continue;
+      44      try {
+      37 -      indices.add((JSON.parse(line) as { index: number }).index
+         -);                                                             
+      45 +      const entry = JSON.parse(line) as Record<string, unknown>
+         + & { index: number };                                          
+      46 +      if (!predicate || predicate(entry)) {                    
+      47 +        indices.add(entry.index);                              
+      48 +      }                                                        
+      49      } catch (err) {
+      50        throw new Error(`Corrupt line ${i + 1} in ${path}: ${(err
+           as Error).message}`);
+      51      }
+     ...
+      53    return indices;
+      54  }
+      55  
+      45 -export function openAppendLog(path: string): NodeJS.WritableStr
+         -eam {                                                          
+      46 -  return createWriteStream(path, { flags: "a", encoding: "utf8"
+         - });                                                           
+      56 +export interface AppendLog {                                   
+      57 +  write(entry: unknown): Promise<void>;                        
+      58 +  close(): Promise<void>;                                      
+      59  }
+      60  
+      49 -export async function appendEntry(ws: NodeJS.WritableStream, en
+         -try: unknown): Promise<void> {                                 
+      50 -  if (!ws.write(JSON.stringify(entry) + "\n")) {               
+      51 -    await once(ws, "drain");                                   
+      52 -  }                                                            
+      61 +// Wraps the raw write stream so a write-time failure (disk ful
+         +l, permission                                                  
+      62 +// revoked mid-run, etc.) surfaces as a rejected promise throug
+         +h write()/                                                     
+      63 +// close() instead of an unhandled "error" event that crashes t
+         +he process                                                     
+      64 +// outside the normal CLI error path.                          
+      65 +export function openAppendLog(path: string): AppendLog {       
+      66 +  const ws = createWriteStream(path, { flags: "a", encoding: "u
+         +tf8" });                                                       
+      67 +  let streamError: Error | null = null;                        
+      68 +  ws.on("error", (err: Error) => {                             
+      69 +    streamError = err;                                         
+      70 +  });                                                          
+      71 +                                                               
+      72 +  return {                                                     
+      73 +    async write(entry: unknown): Promise<void> {               
+      74 +      if (streamError) throw streamError;                      
+      75 +      if (!ws.write(JSON.stringify(entry) + "\n")) {           
+      76 +        // once(ws, "drain") also rejects if `ws` emits "error"
+         + first --                                                      
+      77 +        // Node's events.once() special-cases "error" for any o
+         +ther event                                                     
+      78 +        // it's asked to wait for.                             
+      79 +        await once(ws, "drain");                               
+      80 +      }                                                        
+      81 +      if (streamError) throw streamError;                      
+      82 +    },                                                         
+      83 +    async close(): Promise<void> {                             
+      84 +      ws.end();                                                
+      85 +      await finished(ws);                                      
+      86 +    },                                                         
+      87 +  };                                                           
+      88  }
+
+⏺ Now updating send.ts: the kind field on failure outcomes, filtering
+  failedIndices to permanent-only, and switching to the new AppendLog API.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/send.ts)
+  ⎿  Added 1 line, removed 1 line
+      2  import { parse } from "csv-parse";
+      3  import type { Provider, Recipient, SendResult } from "./provider
+         .js";
+      4  import { createRateLimiter } from "./limits.js";
+      5 -import { appendEntry, loadCompletedIndices, openAppendLog } from
+        - "./logs.js";                                                   
+      5 +import { loadCompletedIndices, openAppendLog } from "./logs.js";
+      6  
+      7  const SUBJECT_TEMPLATE = "A quick note just for {{name}}";
+      8  const BODY_TEMPLATE = [
+
+⏺ Update(src/send.ts)
+  ⎿  Added 14 lines, removed 3 lines
+      35  
+      36  const MAX_ATTEMPTS = 3;
+      37  
+      38 +// "permanent" (a 550-class response) is a durable, never-retry
+         + verdict on                                                    
+      39 +// the address itself. "exhausted" only means this run's 3 atte
+         +mpts all hit                                                   
+      40 +// transient (429-class) responses -- the row is NOT known-bad,
+         + so resume                                                     
+      41 +// must give it another shot rather than skipping it forever li
+         +ke a                                                           
+      42 +// permanent failure.                                          
+      43 +type FailureKind = "permanent" | "exhausted";                  
+      44 +                                                               
+      45  async function sendWithRetry(
+      46    provider: Provider,
+      47    recipient: Recipient,
+      48    subject: string,
+      49    body: string,
+      50    acquireRateSlot: () => Promise<void>,
+      44 -): Promise<{ ok: true } | { ok: false; reason: string }> {     
+      51 +): Promise<{ ok: true } | { ok: false; kind: FailureKind; reaso
+         +n: string }> {                                                 
+      52    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      53      // Every attempt is a real request against the provider, so
+           every
+      54      // attempt -- not just the first -- counts against the rate
+           cap.
+     ...
+      56      await acquireRateSlot();
+      57      const result: SendResult = await provider.send(recipient, s
+          ubject, body);
+      58      if (result.status === "sent") return { ok: true };
+      52 -    if (result.status === "permanent_failure") return { ok: fal
+         -se, reason: result.reason };                                   
+      59 +    if (result.status === "permanent_failure") return { ok: fal
+         +se, kind: "permanent", reason: result.reason };                
+      60      if (attempt < MAX_ATTEMPTS) {
+      61        await new Promise((resolve) => setTimeout(resolve, result
+          .retryAfterMs));
+      62        continue;
+      63      }
+      57 -    return { ok: false, reason: `429 rate-limited, retries exha
+         -usted after ${MAX_ATTEMPTS} attempts` };                       
+      64 +    return {                                                   
+      65 +      ok: false,                                               
+      66 +      kind: "exhausted",                                       
+      67 +      reason: `429 rate-limited, retries exhausted after ${MAX_
+         +ATTEMPTS} attempts`,                                           
+      68 +    };                                                         
+      69    }
+      70    throw new Error("unreachable");
+      71  }
+
+⏺ Now the send() body: filtered failedIndices, new log API, kind written to
+  failed.ndjson.
+
+⏺ Update(src/send.ts)
+  ⎿  Added 3 lines, removed 1 line
+      105    const renderBody = compileTemplate(BODY_TEMPLATE);
+      106  
+      107    const sentIndices = loadCompletedIndices(sentLogPath);
+      108 -  const failedIndices = loadCompletedIndices(failedLogPath);  
+      108 +  // Only "permanent" failures count as done-forever; "exhaust
+          +ed" rows are                                                  
+      109 +  // eligible to be retried by this very run.                 
+      110 +  const failedIndices = loadCompletedIndices(failedLogPath, (e
+          +ntry) => entry.kind === "permanent");                         
+      111    const alreadyDone = sentIndices.size + failedIndices.size;
+      112  
+      113    const totalRows = await countDataRows(csvPath);
+
+⏺ Update(src/send.ts)
+  ⎿  Added 7 lines, removed 2 lines
+      139      const outcome = await sendWithRetry(provider, recipient, s
+           ubject, body, acquireRateSlot);
+      140  
+      141      if (outcome.ok) {
+      142 -      await appendEntry(sentLog, { index: recipient.index }); 
+      142 +      await sentLog.write({ index: recipient.index });        
+      143        sentCount++;
+      144      } else {
+      145 -      await appendEntry(failedLog, { index: recipient.index, e
+          -mail: recipient.email, reason: outcome.reason });             
+      145 +      await failedLog.write({                                 
+      146 +        index: recipient.index,                               
+      147 +        email: recipient.email,                               
+      148 +        kind: outcome.kind,                                   
+      149 +        reason: outcome.reason,                               
+      150 +      });                                                     
+      151        failedCount++;
+      152      }
+      153    }
+
+⏺ Now the final .end() calls → .close(), awaited.
+
+⏺ Update(src/send.ts)  ⎿  Added 2 lines, removed 2 lines
+      189    clearInterval(progressTimer);
+      190    printProgress(true);
+      191  
+      192 -  sentLog.end();                                              
+      193 -  failedLog.end();                                            
+      192 +  await sentLog.close();                                      
+      193 +  await failedLog.close();                                    
+      194  
+      195    const limitSuffix = limit !== undefined ? ` limit=${limit}` 
+           : "";
+      196    console.log(
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Now the two "decline, but document" items — a comment on countDataRows, and
+  check whether a README exists for the rate-limiter tradeoff note.
+
+  Listed 1 directory (ctrl+o to expand)
+
+⏺ Update(src/send.ts)
+  ⎿  Added 6 lines, removed 1 line
+      71  }
+      72  
+      73  // Fast streaming line count so the progress line can show a re
+          al
+      74 -// "remaining" figure. Never buffers rows, just counts newlines
+         -.                                                              
+      74 +// "remaining" figure. Never buffers rows, just counts newlines
+         + -- display                                                    
+      75 +// only, not used for send correctness (the real read loop uses
+         + the CSV                                                       
+      76 +// parser below). Assumes no field contains an embedded literal
+         + newline;                                                      
+      77 +// our own generate.ts never emits one, so this holds for CSVs 
+         +produced by                                                    
+      78 +// this tool. A hand-authored CSV with a quoted multi-line fiel
+         +d would                                                        
+      79 +// inflate this count and skew the progress/remaining numbers. 
+      80  async function countDataRows(csvPath: string): Promise<number> 
+          {
+      81    return new Promise((resolve, reject) => {
+      82      let newlineCount = 0;
+
+⏺ Now the README note for the rate limiter tradeoff.
+
+⏺ Write(README.md)
+  ⎿  Wrote 13 lines to README.md
+       1 # bulksend
+       3 ## Known characteristics
+       4 
+         t or sliding
+         ugh for a
+       7   single-process assessment tool, and adding a token-bucket depe
+       8   be scope creep for what it buys. The tradeoff: requests can bu
+         rst to
+         -rate`
+         re land
+     … +10 lines (ctrl+o to expand)
+
+⏺ Now the cli.ts changes: unknown-flag rejection and per-mode log file split.
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 10 lines
+      13    return value;
+      14  }
+      15  
+      16 +function assertKnownFlags(flags: Record<string, string>, allowe
+         +d: readonly string[], command: string): void {                 
+      17 +  const unknown = Object.keys(flags).filter((key) => !allowed.i
+         +ncludes(key));                                                 
+      18 +  if (unknown.length > 0) {                                    
+      19 +    console.error(                                             
+      20 +      `Unknown flag(s) for '${command}': ${unknown.map((f) => `
+         +--${f}`).join(", ")}\nAllowed: ${allowed.map((f) => `--${f}`).j
+         +oin(", ")}`,                                                   
+      21 +    );                                                         
+      22 +    process.exit(1);                                           
+      23 +  }                                                            
+      24 +}                                                              
+      25 +                                                               
+      26  function parseFlags(args: string[]): Record<string, string> {
+      27    const flags: Record<string, string> = {};
+      28    for (let i = 0; i < args.length; i++) {
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 1 line
+      46  
+      47    switch (command) {
+      48      case "generate": {
+      49 +      assertKnownFlags(flags, ["count", "out"], "generate");   
+      50        const count = flags.count !== undefined ? parsePositiveIn
+          t(flags.count, "count") : 1_000_000;
+      51        const out = flags.out ?? "recipients.csv";
+      52        console.log(`Generating ${count.toLocaleString()} rows to
+           ${out}...`);
+
+⏺ Update(src/cli.ts)
+  ⎿  Added 10 lines, removed 2 lines
+      57        break;
+      58      }
+      59      case "send": {
+      60 +      assertKnownFlags(flags, ["csv", "concurrency", "rate", "s
+         +mtp", "limit"], "send");                                       
+      61        const csvPath = flags.csv ?? "recipients.csv";
+      62        const concurrency = flags.concurrency !== undefined ? par
+          sePositiveInt(flags.concurrency, "concurrency") : 50;
+      63        const rate = flags.rate !== undefined ? parsePositiveInt(
+          flags.rate, "rate") : 14;
+     ...
+      79          }
+      80        }
+      81  
+      82 +      // Separate log files per transport: a mock dry-run "sent
+         +" and a real                                                   
+      83 +      // SMTP "sent" must never be treated as interchangeable o
+         +n resume --                                                    
+      84 +      // otherwise a prior dry-run silently makes --smtp skip r
+         +ows it has                                                     
+      85 +      // never actually sent for real.                         
+      86 +      const sentLogPath = useSmtp ? "sent.smtp.ndjson" : "sent.
+         +ndjson";                                                       
+      87 +      const failedLogPath = useSmtp ? "failed.smtp.ndjson" : "f
+         +ailed.ndjson";                                                 
+      88 +                                                               
+      89        await send({
+      90          csvPath,
+      83 -        sentLogPath: "sent.ndjson",                            
+      84 -        failedLogPath: "failed.ndjson",                        
+      91 +        sentLogPath,                                           
+      92 +        failedLogPath,                                         
+      93          concurrency,
+      94          ratePerSecond: rate,
+      95          dryRun: !useSmtp,
+
+⏺ Now typecheck and confirm .gitignore already covers the new log filenames.
+
+  Ran 1 shell command (ctrl+o to expand)
+
+⏺ Quick manual sanity checks before handing back to the tester agent for the
+  full rerun.
+
+  Ran 3 shell commands (ctrl+o to expand)
+
+⏺ All four fixes verified manually. Now resuming the tester agent to rerun its
+  full suite against the updated code.
+
+⏺ Agent(Resume tester: rerun suite after fixes)
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+⏺ All four fixes implemented and manually spot-checked (exhausted-vs-permanent
+  skip behavior, unknown-flag rejection, separate log files, kind field on
+  failures). Tester agent is now re-running its full suite plus a new test
+  targeting the exhausted-retry fix specifically. I'll report back when it's
+  done.
+
+✻ Worked for 4m 21s
+
+⏺ Agent "Resume tester: rerun suite after fixes" finished · 23m 12s
+
+⏺ Test results first, then an important process note.
+
+  Tests 1-4: still pass unchanged. No update needed — their dedup assertions
+  only extract .index via a type assertion, so the new kind field on
+  failed.ndjson lines is transparently ignored.
+
+  New test 5 (test/05-exhausted-vs-permanent-retry.test.ts): hand-crafts one
+  kind:"exhausted" and one kind:"permanent" entry for unsent rows, runs send,
+  and confirms the permanent one is skipped while the exhausted one gets
+  reprocessed. Ran 4x back-to-back, passed every time.
+
+  Smoke checks: unknown-flag rejection confirmed for both commands.
+  Error-listener fix confirmed directly (pointed a log at a nonexistent
+  directory, write()/close() rejected cleanly instead of crashing). Log-file
+  separation confirmed — --smtp against a dead port wrote 3 ECONNREFUSED
+  failures only to failed.smtp.ndjson, sent.ndjson/failed.ndjson byte-identical
+  before/after (it incidentally hit your real Mailpit container on its first
+  attempt, stopped it to get a clean negative test, then restarted it
+  afterward).
+
+  Process mistake on my end, worth flagging plainly: this second run wasn't
+  actually a resume of the same blinded agent. I passed a to field the Agent
+  tool doesn't support for non-fork agents — it silently launched a new
+  general-purpose agent instead, and that new agent never received the "never
+  read docs/plan.md or NOTES.md" hard rule (I'd only referenced it in passing,
+  assuming persona continuity that didn't exist). So it read both files this
+  time and used that to add one aside: docs/plan.md's "Done when #5" line still
+  says failed rows "are not retried on resume," which is now stale text — the
+  plan doc wasn't updated when we added the exhausted/permanent split. That's
+  the only place doc-reading leaked into its output; the actual test evidence
+  (commands run, files inspected, byte-for-byte diffs) doesn't depend on having
+  read the plan, so I'd still trust it. But the blind-review property you asked
+  for didn't hold for this run — noting it rather than quietly letting it slide.
+
+  Want me to update that stale line in docs/plan.md, and/or should I use the
+  properly-registered tester agent (via SendMessage, once you restart the
+  session) for any future blind reviews instead of re-launching general-purpose
+  agents by hand?
+
+✻ Baked for 44m 14s
+
+❯ good that you flagged the blind break plainly instead of letting it slide. my 
+  read: the blindness mattered for the first run - the cold review and test     
+  design - and that one held. the rerun was regression verification of          
+  already-known fixes, so I'm not going to redo it. but note it as a known      
+  limitation, and yes - for any future blind review, register the tester agent  
+  properly instead of hand-launching general-purpose                            
+                                                                                
+  yes, update the stale Done when #5 line in docs/plan.md to reflect the        
+  exhausted/permanent split - the plan should describe current behavior, git    
+  history keeps the evolution                                                   
+                                                                                
+  also add an npm test script that runs all 5 test files in order so a reviewer 
+  can run everything with one command                                           
+
+  Read 1 file (ctrl+o to expand)
+⏺ Update(docs/plan.md)
+  ⎿  Added 6 lines, removed 3 lines
+      21    550 responses, so the backoff path and dead-letter path are a
+          ctually exercised,
+      22    not just theoretical.
+      23  - **Three outcomes per recipient, not two.** `sent.ndjson` (row
+           index, on provider
+      24 -  ack), `failed.ndjson` (permanent failures — mock 550 — logged
+         - and skipped, never                                            
+      25 -  retried), and implicit "pending" (absence from both). Transie
+         -nt failures (429/5xx)                                          
+      26 -  retry with backoff; they don't touch either log until resolve
+         -d.                                                             
+      24 +  ack), `failed.ndjson` (each entry tagged `kind: "permanent" |
+         + "exhausted"` — a                                              
+      25 +  550-class response is permanent and skipped forever; a row th
+         +at only exhausted                                              
+      26 +  its 3 in-run retries on transient 429s is not known-bad, so i
+         +t's not skipped on                                             
+      27 +  the next `send` run and gets reprocessed), and implicit "pend
+         +ing" (absence from                                             
+      28 +  both, or an "exhausted" entry). Transient failures retry with
+         + backoff within a                                              
+      29 +  run before ever reaching that exhausted state.               
+      30  - **At-least-once, not exactly-once — stated, not hidden.** A k
+          ill between "provider
+      31    accepted" and "log write flushed" can double-send. We accept 
+          and document this
+      32    rather than claim a guarantee the design can't back up.
+
+⏺ Update(docs/plan.md)
+  ⎿  Added 4 lines, removed 2 lines
+      101  2. `send --dry-run` completes all 1M with progress + emails/se
+           c stats.
+      102  3. Running `send` twice = zero duplicate sends (proven by test
+           ).
+      103  4. `kill -9` mid-run, restart = resumes where it died, no dupl
+           icates (proven by test).
+      104 -5. Permanently-failing addresses land in `failed.ndjson` and a
+          -re not retried on                                             
+      105 -   resume (proven by test).                                   
+      104 +5. Permanently-failing addresses land in `failed.ndjson` with 
+          +`kind: "permanent"`                                           
+      105 +   and are not retried on resume; addresses that only exhauste
+          +d in-run retries                                              
+      106 +   land with `kind: "exhausted"` and DO get retried on the nex
+          +t resume, rather                                              
+      107 +   than being treated as dead forever (proven by test).       
+      108  6. ~100 emails visible in Mailpit, names personalized correctl
+           y (screenshot).
+      109  7. README lists every assumption, the at-least-once tradeoff, 
+           and both throughput
+      110     numbers (measured mock vs. real-provider estimate).
+
+⏺ Now the npm test script.
+
+  Read 1 file, listed 1 directory (ctrl+o to expand)
+
+⏺ Update(package.json)
+  ⎿  Added 2 lines, removed 1 line
+       6    "scripts": {
+       7      "generate": "tsx src/cli.ts generate",
+       8      "send": "tsx src/cli.ts send",
+       9 -    "typecheck": "tsc --noEmit"                                
+       9 +    "typecheck": "tsc --noEmit",                               
+      10 +    "test": "for f in test/*.test.ts; do echo \"--- $f ---\"; n
+         +px tsx \"$f\" || exit 1; done"                                 
+      11    },
+      12    "dependencies": {
+      13      "csv-parse": "^7.0.1",
+
+⏺ Now verifying it actually runs all five in order and reports correctly.
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ npm test runs all 5 files in order, exit code 0, all PASS. Done:
+
+  - Memory: saved a feedback memory about the resume/blindness mistake so it's
+  not repeated — Agent's to field only works for forks; resuming a constrained
+  persona on a fresh general-purpose agent silently drops the constraint.
+  Register named agents for anything requiring enforced blindness.
+  - docs/plan.md: updated the "Three outcomes" decision and "Done when #5" to
+  describe the actual permanent/exhausted split, rather than the old "never
+  retried" claim.
+  - package.json: added npm test, runs test/*.test.ts in numeric order, fails
+  fast on the first non-zero exit. Verified clean pass, exit 0, all 5 files ran.
+
+✻ Crunched for 1m 35s
+
+※ recap: Building a bulk-email CLI (mock/SMTP send with resume-safe logging) for a technical assessment; latest work added retry-kind tracking, safer logs, and a test suite, all now passing via npm test. Next: decide whether to fix any remaining code-review findings or move on to write-up.
+
+❯ now write the full README.md (keep the existing Known characteristics         
+  section, fold it in). structure:                                              
+                                                                                
+  1. what this is - one paragraph: CLI that sends a personalized campaign to 1M 
+  recipients, built as a hands-on exercise in throughput, idempotency, and      
+  crash-safe resumability. dry-run by default, never emails real inboxes        
+  2. quick start - docker mailpit command, npm install, npm run generate, the   
+  three send variants (dry-run default, custom rate/concurrency, --smtp --limit 
+  against mailpit), npm test                                                    
+  3. architecture - ~10 lines, the module layout from the plan                  
+  4. measured results, use these real numbers:                                  
+     - 1M dry-run at --concurrency 100 --rate 5000: 997,914 sent + 2,086 failed 
+  = 1,000,000 exactly, ~1845/s sustained, ~9min wall                            
+     - theoretical ceiling at concurrency 100: 100 / 0.05s avg mock latency =   
+  2000/s, so measured is ~92% of ceiling - pipeline is not the bottleneck, the  
+  (simulated) provider is                                                       
+     - real-world framing: at SES default 14 req/s, 1M emails ≈ 20 hours        
+  regardless of code speed. throughput is a provider negotiation, not a code    
+  property                                                                      
+  5. delivery semantics - at-least-once, the torn-write self-heal, permanent vs 
+  exhausted failures and what resume does with each                             
+  6. assumptions - stable csv between runs, no embedded newlines in fields      
+  (generator never emits them), mailpit on localhost:1025                       
+  7. safety rails - dry-run default, --smtp requires --limit capped at 1000,    
+  structural read cap not just a send cap, @example.test addresses              
+  8. what changes for production - real ESP behind the provider interface       
+  (config swap), connection pooling for smtp, ESP idempotency keys for          
+  exactly-once, bounce/complaint handling, unsubscribe, warm-up, distributed    
+  workers past single-process scale                                             
+                                                                                
+  keep it honest and compact - no marketing language, no claims beyond what was 
+  measured                                                                      
+
+  Ran 2 shell commands (ctrl+o to expand)
+
+⏺ The files already on disk match those exact numbers — this is real leftover
+  data from an actual run, not something I need to re-run. Let me check file
+  timestamps to independently confirm the ~9min wall-clock figure.
+
+  Read 2 files (ctrl+o to expand)
+
+⏺ Write(README.md)
+  ⎿  Added 157 lines, removed 10 lines
+        1  # bulksend
+        2  
+        3 -## Known characteristics                                      
+        3 +## What this is                                               
+        4  
+        5 -- **Rate limiter is a fixed per-second window, not a token buc
+          -ket or sliding                                                
+        6 -  window.** This is intentional -- a plain window counter is e
+          -nough for a                                                   
+        7 -  single-process assessment tool, and adding a token-bucket de
+          -pendency would                                                
+        8 -  be scope creep for what it buys. The tradeoff: requests can 
+          -burst to                                                      
+        9 -  roughly 2x `--rate` for a moment at window boundaries (e.g. 
+          -`--rate`                                                      
+       10 -  requests land right at the end of one window, then `--rate` 
+          -more land                                                     
+       11 -  immediately at the start of the next). Acceptable against th
+          -e mock                                                        
+       12 -  provider and against Mailpit; worth knowing if `--rate` is m
+          -eant to model                                                 
+       13 -  a real provider's hard per-second cap rather than a rough ce
+          -iling.                                                        
+        5 +A CLI that sends one personalized promotional email to up to a
+          + million                                                      
+        6 +recipients. It's a hands-on exercise in the three things that 
+          +actually make                                                 
+        7 +"send 1M emails" hard: sustained throughput under a provider's
+          + rate limit,                                                  
+        8 +idempotent delivery so a crash never means a duplicate send, a
+          +nd resuming                                                   
+        9 +cleanly from wherever a run stopped. Dry-run against an in-pro
+          +cess mock                                                     
+       10 +provider is the default mode — it never contacts a real mail s
+          +erver or                                                      
+       11 +emails a real inbox unless you explicitly opt into `--smtp` po
+          +inted at a                                                    
+       12 +local Mailpit instance.                                       
+       13 +                                                              
+       14 +## Quick start                                                
+       15 +                                                              
+       16 +```bash                                                       
+       17 +# 1. Start Mailpit (only needed for --smtp mode; dry-run doesn
+          +'t need it)                                                   
+       18 +docker run -d --name mailpit -p 1025:1025 -p 8025:8025 axllent
+          +/mailpit                                                      
+       19 +                                                              
+       20 +# 2. Install                                                  
+       21 +npm install                                                   
+       22 +                                                              
+       23 +# 3. Generate recipients (defaults to 1,000,000 rows -> recipi
+          +ents.csv)                                                     
+       24 +npm run generate                                              
+       25 +                                                              
+       26 +# 4a. Send, dry-run (default: mock provider, concurrency 50, r
+          +ate 14/s)                                                     
+       27 +npm run send                                                  
+       28 +                                                              
+       29 +# 4b. Send, dry-run with custom throughput knobs              
+       30 +npm run send -- --concurrency 100 --rate 5000                 
+       31 +                                                              
+       32 +# 4c. Send for real, against Mailpit only (requires --limit, c
+          +apped at 1000)                                                
+       33 +npm run send -- --smtp --limit 100                            
+       34 +                                                              
+       35 +# 5. Run the test suite                                       
+       36 +npm test                                                      
+       37 +```                                                           
+       38 +                                                              
+       39 +Mailpit's web UI (received mail) is at `http://localhost:8025`
+          +.                                                             
+       40 +                                                              
+       41 +## Architecture                                               
+       42 +                                                              
+       43 +```                                                           
+       44 +src/cli.ts        entry point — flag parsing, wires generate/s
+          +end commands                                                  
+       45 +src/generate.ts   streams recipients.csv (email,name) to disk,
+          + flat memory                                                  
+       46 +src/send.ts       reads the CSV, drives the send loop: templat
+          +e render,                                                     
+       47 +                   bounded concurrency, rate limiting, retry, 
+          +logging                                                       
+       48 +src/provider.ts   Provider interface; mock (simulated latency 
+          ++ injected                                                    
+       49 +                   failures) and smtp (nodemailer -> Mailpit) 
+          +implementations                                               
+       50 +src/limits.ts     per-second rate limiter                     
+       51 +src/logs.ts       sent.ndjson / failed.ndjson: resume-state lo
+          +ad + append                                                   
+       52 +test/             5 test files (unit + integration), run via `
+          +npm test`                                                     
+       53 +```                                                           
+       54 +                                                              
+       55 +## Measured results                                           
+       56 +                                                              
+       57 +One real run, not a projection: `npm run generate` (1,000,000 
+          +rows), then                                                   
+       58 +`npm run send -- --concurrency 100 --rate 5000` against the mo
+          +ck provider.                                                  
+       59 +                                                              
+       60 +- **997,914 sent + 2,086 failed = 1,000,000 exactly** — every 
+          +row accounted                                                 
+       61 +  for once, matching the mock's injected ~0.2% permanent / ~1%
+          + transient                                                    
+       62 +  failure rates at this scale.                                
+       63 +- **~1,845 emails/sec sustained**, wall clock ~9 minutes (542s
+          +, timed from                                                  
+       64 +  the run's own file timestamps: first write to last write).  
+       65 +- **Theoretical ceiling at this concurrency**: with the mock's
+          + 20–80ms                                                      
+       66 +  simulated latency (avg 50ms), 100 concurrent slots gives a c
+          +eiling of                                                     
+       67 +  `100 / 0.05s = 2,000/s`. Measured throughput (1,845/s) is **
+          +~92% of that                                                  
+       68 +  ceiling** — the pipeline itself isn't the bottleneck, the (s
+          +imulated)                                                     
+       69 +  provider's per-request latency is, which is the realistic co
+          +nstraint to                                                   
+       70 +  design around.                                              
+       71 +- **Real-world framing**: at SES's default new-account rate of
+          + 14 req/s,                                                    
+       72 +  1,000,000 emails takes `1,000,000 / 14 ≈ 71,400s ≈ 19.8 hour
+          +s`,                                                           
+       73 +  regardless of how fast this code runs. Past a certain point,
+          + throughput                                                   
+       74 +  is a negotiation with the provider for a higher rate limit, 
+          +not a                                                         
+       75 +  property of the code.                                       
+       76 +                                                              
+       77 +## Delivery semantics                                         
+       78 +                                                              
+       79 +- **At-least-once, not exactly-once, and that's a stated trade
+          +off, not a                                                    
+       80 +  hidden gap.** A hard kill between "provider accepted the sen
+          +d" and "the                                                   
+       81 +  log write for it landed on disk" can double-send that one ro
+          +w. The                                                        
+       82 +  design accepts this rather than claiming a guarantee it can'
+          +t back up                                                     
+       83 +  (see "what changes for production" below for the real fix). 
+       84 +- **Torn-write self-heal.** A kill mid-`write()` can leave a l
+          +og file                                                       
+       85 +  ending in a partial line with no trailing newline. Only newl
+          +ine-terminated                                                
+       86 +  lines count as durably recorded: on startup, any bytes after
+          + the last                                                     
+       87 +  complete line are discarded from the resume state *and* trun
+          +cated off the                                                 
+       88 +  file on disk, so the log is clean before this run's first ap
+          +pend and that                                                 
+       89 +  row is simply treated as not-yet-processed. A malformed line
+          + anywhere                                                     
+       90 +  else in the file — not the torn tail — is real corruption, n
+          +ot a torn                                                     
+       91 +  write, and is a hard error.                                 
+       92 +- **Permanent vs. exhausted failures are tracked separately**,
+          + via a `kind`                                                 
+       93 +  field on each `failed.ndjson` entry. `kind: "permanent"` (a 
+          +550-class                                                     
+       94 +  response) is a durable verdict on the address and is skipped
+          + forever on                                                   
+       95 +  resume. `kind: "exhausted"` means this run's 3 in-run retrie
+          +s all hit                                                     
+       96 +  transient (429-class) responses — the address isn't known-ba
+          +d, so it is                                                   
+       97 +  *not* skipped on the next `send` run and gets a fresh set of
+          + attempts.                                                    
+       98 +  The old exhausted entry stays in the append-only log; a row 
+          +can                                                           
+       99 +  legitimately appear once as `"exhausted"` and later once in 
+          +`sent.ndjson`                                                 
+      100 +  once it succeeds on a subsequent run.                       
+      101 +- **Rate limiter is a fixed per-second window, not a token buc
+          +ket or                                                        
+      102 +  sliding window.** This is intentional — a plain window count
+          +er is enough                                                  
+      103 +  for a single-process tool, and a token-bucket dependency wou
+          +ld be scope                                                   
+      104 +  creep for what it buys. The tradeoff: requests can burst to 
+          +roughly 2x                                                    
+      105 +  `--rate` for a moment at window boundaries (e.g. `--rate` re
+          +quests land                                                   
+      106 +  right at the end of one window, then `--rate` more land imme
+          +diately at                                                    
+      107 +  the start of the next). Acceptable against the mock provider
+          + and against                                                  
+      108 +  Mailpit; worth knowing if `--rate` is meant to model a real 
+          +provider's                                                    
+      109 +  hard per-second cap rather than a rough ceiling.            
+      110 +                                                              
+      111 +## Assumptions                                                
+      112 +                                                              
+      113 +- `recipients.csv` is stable and not reordered between runs — 
+          +resume is                                                     
+      114 +  tracked by row index, not by email string, so a reordered fi
+          +le breaks                                                     
+      115 +  the resume guarantee.                                       
+      116 +- No CSV field contains an embedded literal newline. The real 
+          +send loop                                                     
+      117 +  uses a proper CSV parser and would handle this correctly, bu
+          +t the                                                         
+      118 +  progress line's "remaining" figure comes from a fast newline
+          +-counting                                                     
+      119 +  pre-pass that assumes one row per line; `generate.ts` never 
+          +emits an                                                      
+      120 +  embedded newline, so this holds for CSVs produced by this to
+          +ol.                                                           
+      121 +- Mailpit is reachable at `localhost:1025` for `--smtp` mode, 
+          +with no auth                                                  
+      122 +  and no TLS (its defaults).                                  
+      123 +                                                              
+      124 +## Safety rails                                               
+      125 +                                                              
+      126 +- **Dry-run is the default.** No flag is required to be safe —
+          + the script                                                   
+      127 +  never touches a real transport unless `--smtp` is passed exp
+          +licitly.                                                      
+      128 +- **`--smtp` requires an explicit `--limit N`**, capped at a c
+          +eiling of                                                     
+      129 +  1000. Omitting `--limit`, or passing one above the ceiling, 
+          +is a hard                                                     
+      130 +  error, not a warning.                                       
+      131 +- **The limit is a structural read cap, not just a send cap.**
+          + The CSV                                                      
+      132 +  read loop itself stops once `limit` rows have been read — ro
+          +ws beyond                                                     
+      133 +  the limit are never even parsed in a non-dry-run, not merely
+          + skipped                                                      
+      134 +  after being looked at.                                      
+      135 +- **All generated addresses use `@example.test`**, a domain re
+          +served by                                                     
+      136 +  RFC 2606 and guaranteed to never resolve, so even a bug that
+          + bypassed                                                     
+      137 +  every other safeguard couldn't reach a real inbox.          
+      138 +                                                              
+      139 +## What changes for production                                
+      140 +                                                              
+      141 +This tool is deliberately scoped to a single-process assessmen
+          +t. Getting                                                    
+      142 +from here to a real campaign sender means:                    
+      143 +                                                              
+      144 +- **A real ESP behind the `Provider` interface.** The mock and
+          + Mailpit                                                      
+      145 +  providers already prove the interface works; swapping in SES
+          +/Postmark/etc.                                                
+      146 +  is a config change, not a rewrite.                          
+      147 +- **Connection pooling for SMTP.** The current `nodemailer` tr
+          +ansport opens                                                 
+      148 +  connections per call with no pooling configured — fine again
+          +st local                                                      
+      149 +  Mailpit, not fine at real scale.                            
+      150 +- **Provider-side idempotency keys for actual exactly-once del
+          +ivery.** Real                                                 
+      151 +  ESPs (SES, Postmark) accept a client-supplied message ID for
+      152 +  deduplication on their end — the real fix for the at-least-o
+          +nce gap                                                       
+      153 +  documented above, out of scope for a mock provider.         
+      154 +- **Bounce and complaint handling**, **unsubscribe management*
+          +*, and                                                        
+      155 +  **sender/IP warm-up** — all real deliverability concerns, al
+          +l                                                             
+      156 +  deliberately out of scope here.                             
+      157 +- **Distributed workers past single-process scale.** Bounded c
+          +oncurrency                                                    
+      158 +  in one process is the right answer up to a provider's rate l
+          +imit; beyond                                                  
+      159 +  that (multiple provider accounts, multiple sending IPs) need
+          +s                                                             
+      160 +  coordination this tool doesn't attempt.                     
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ README.md is written (160 lines, all 8 sections). Worth flagging: the
+  "Measured results" numbers weren't something I re-ran — I found
+  recipients.csv/sent.ndjson/failed.ndjson already sitting in the project root
+  matching your figures exactly (997,914 / 2,086 / 1,000,000), and cross-checked
+  the ~9min wall-clock claim independently against the files' actual
+  birthtime→mtime span (9m02s, which backs out to 1845/s almost exactly) rather
+  than just taking the number on faith. Everything else in the doc reflects the
+  code as it stands now, including the kind: "permanent"/"exhausted" split and
+  the log-separation/limit-cap safety rails from this session's fixes.
+
+✻ Crunched for 1m 50s
+
+❯ in measured results, drop the 'timed from file timestamps' claim - just say   
+  ~9 minutes wall, derived from 1M ÷ 1845/s. don't dress up methodology         
+
+⏺ Update(README.md)
+  ⎿  Added 2 lines, removed 2 lines
+      60  - **997,914 sent + 2,086 failed = 1,000,000 exactly** — every r
+          ow accounted
+      61    for once, matching the mock's injected ~0.2% permanent / ~1% 
+          transient
+      62    failure rates at this scale.
+      63 -- **~1,845 emails/sec sustained**, wall clock ~9 minutes (542s,
+         - timed from                                                    
+      64 -  the run's own file timestamps: first write to last write).   
+      63 +- **~1,845 emails/sec sustained**, ~9 minutes wall clock (1,000
+         +,000 ÷                                                         
+      64 +  1,845/s ≈ 542s).                                             
+      65  - **Theoretical ceiling at this concurrency**: with the mock's 
+          20–80ms
+      66    simulated latency (avg 50ms), 100 concurrent slots gives a ce
+          iling of
+      67    `100 / 0.05s = 2,000/s`. Measured throughput (1,845/s) is **~
+          92% of that
+
+⏺ Done.
+
+✻ Brewed for 6s
+
+※ recap: Building a bulk-email CLI assessment (streaming, crash-safe resume, rate-limited sending) with tests and docs in place. Just trimmed a methodology claim from the README's measured-results section per your request; nothing else pending right now.
