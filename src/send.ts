@@ -1,6 +1,6 @@
 import { createReadStream } from "node:fs";
 import { parse } from "csv-parse";
-import { mockProvider, type Recipient, type SendResult } from "./provider.js";
+import type { Provider, Recipient, SendResult } from "./provider.js";
 import { createRateLimiter } from "./limits.js";
 import { appendEntry, loadCompletedIndices, openAppendLog } from "./logs.js";
 
@@ -26,11 +26,17 @@ export interface SendOptions {
   concurrency: number;
   ratePerSecond: number;
   dryRun: boolean;
+  provider: Provider;
+  // Hard cap on how many CSV rows are even read this run. Required and
+  // enforced whenever dryRun is false -- SMTP mode must never be able to
+  // reach the full recipient list.
+  limit?: number;
 }
 
 const MAX_ATTEMPTS = 3;
 
 async function sendWithRetry(
+  provider: Provider,
   recipient: Recipient,
   subject: string,
   body: string,
@@ -41,7 +47,7 @@ async function sendWithRetry(
     // attempt -- not just the first -- counts against the rate cap.
     // Otherwise a retry storm can push actual request rate above --rate.
     await acquireRateSlot();
-    const result: SendResult = await mockProvider.send(recipient, subject, body);
+    const result: SendResult = await provider.send(recipient, subject, body);
     if (result.status === "sent") return { ok: true };
     if (result.status === "permanent_failure") return { ok: false, reason: result.reason };
     if (attempt < MAX_ATTEMPTS) {
@@ -75,10 +81,13 @@ async function countDataRows(csvPath: string): Promise<number> {
 }
 
 export async function send(options: SendOptions): Promise<void> {
-  const { csvPath, sentLogPath, failedLogPath, concurrency, ratePerSecond, dryRun } = options;
+  const { csvPath, sentLogPath, failedLogPath, concurrency, ratePerSecond, dryRun, provider, limit } = options;
 
-  if (!dryRun) {
-    throw new Error("Only --dry-run is supported right now; SMTP sending is not implemented yet.");
+  // Belt-and-suspenders: the CLI already refuses --smtp without --limit,
+  // but this is the function that actually talks to a real transport, so
+  // the invariant is enforced here too, not just at the flag-parsing layer.
+  if (!dryRun && (limit === undefined || limit <= 0)) {
+    throw new Error("Refusing to run a non-dry-run send without a positive limit.");
   }
 
   const renderSubject = compileTemplate(SUBJECT_TEMPLATE);
@@ -89,6 +98,7 @@ export async function send(options: SendOptions): Promise<void> {
   const alreadyDone = sentIndices.size + failedIndices.size;
 
   const totalRows = await countDataRows(csvPath);
+  const effectiveTotal = limit !== undefined ? Math.min(totalRows, limit) : totalRows;
 
   const sentLog = openAppendLog(sentLogPath);
   const failedLog = openAppendLog(failedLogPath);
@@ -103,7 +113,7 @@ export async function send(options: SendOptions): Promise<void> {
     const elapsedSec = (Date.now() - startedAt) / 1000;
     const processed = sentCount + failedCount;
     const rate = elapsedSec > 0 ? processed / elapsedSec : 0;
-    const remaining = Math.max(totalRows - alreadyDone - processed, 0);
+    const remaining = Math.max(effectiveTotal - alreadyDone - processed, 0);
     const line = `sent=${sentCount} failed=${failedCount} skipped=${skippedCount} remaining=${remaining} (${rate.toFixed(1)}/s)`;
     process.stdout.write(final ? `${line}\n` : `\r${line}   `);
   }
@@ -113,7 +123,7 @@ export async function send(options: SendOptions): Promise<void> {
   async function processRow(recipient: Recipient): Promise<void> {
     const subject = renderSubject(recipient.name);
     const body = renderBody(recipient.name);
-    const outcome = await sendWithRetry(recipient, subject, body, acquireRateSlot);
+    const outcome = await sendWithRetry(provider, recipient, subject, body, acquireRateSlot);
 
     if (outcome.ok) {
       await appendEntry(sentLog, { index: recipient.index });
@@ -133,6 +143,12 @@ export async function send(options: SendOptions): Promise<void> {
 
   for await (const record of parser as AsyncIterable<Record<string, string>>) {
     const index = rowIndex++;
+
+    if (limit !== undefined && index >= limit) {
+      // Hard structural cap: stop reading the CSV entirely. Rows beyond
+      // --limit are never even looked at in a non-dry-run.
+      break;
+    }
 
     if (sentIndices.has(index) || failedIndices.has(index)) {
       skippedCount++;
@@ -158,7 +174,8 @@ export async function send(options: SendOptions): Promise<void> {
   sentLog.end();
   failedLog.end();
 
+  const limitSuffix = limit !== undefined ? ` limit=${limit}` : "";
   console.log(
-    `Done. sent=${sentCount} failed=${failedCount} skipped=${skippedCount} total_rows=${totalRows} already_done_before_this_run=${alreadyDone}`,
+    `Done. sent=${sentCount} failed=${failedCount} skipped=${skippedCount} total_rows_in_file=${totalRows}${limitSuffix} already_done_before_this_run=${alreadyDone}`,
   );
 }

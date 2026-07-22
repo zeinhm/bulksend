@@ -1,3 +1,5 @@
+import nodemailer from "nodemailer";
+
 export interface Recipient {
   index: number;
   email: string;
@@ -35,5 +37,31 @@ export const mockProvider: Provider = {
       return { status: "rate_limited", retryAfterMs: 200 + Math.random() * 300 };
     }
     return { status: "sent" };
+  },
+};
+
+const FROM_ADDRESS = "campaign@example.test";
+
+// Mailpit's default SMTP listener: no auth, no TLS.
+const transporter = nodemailer.createTransport({
+  host: "localhost",
+  port: 1025,
+  secure: false,
+});
+
+export const smtpProvider: Provider = {
+  async send(recipient: Recipient, subject: string, body: string): Promise<SendResult> {
+    try {
+      await transporter.sendMail({ from: FROM_ADDRESS, to: recipient.email, subject, text: body });
+      return { status: "sent" };
+    } catch (err) {
+      const responseCode = (err as { responseCode?: unknown }).responseCode;
+      // SMTP 4xx is a temporary failure (retry); 5xx and everything else is
+      // treated as permanent, matching the mock provider's split.
+      if (typeof responseCode === "number" && responseCode >= 400 && responseCode < 500) {
+        return { status: "rate_limited", retryAfterMs: 300 };
+      }
+      return { status: "permanent_failure", reason: err instanceof Error ? err.message : String(err) };
+    }
   },
 };

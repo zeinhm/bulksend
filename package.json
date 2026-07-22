@@ -9,10 +9,12 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "csv-parse": "^7.0.1"
+    "csv-parse": "^7.0.1",
+    "nodemailer": "^9.0.3"
   },
   "devDependencies": {
     "@types/node": "^20.14.0",
+    "@types/nodemailer": "^8.0.1",
     "tsx": "^4.16.0",
     "typescript": "^5.5.0"
   }
